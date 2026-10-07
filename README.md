@@ -158,6 +158,9 @@ Every other key is the original MGPU Bridge setting; see [`bridge/README.md`](br
 
 Opening the ReShade menu hides the DLSS 5 image (the menu is drawn by the game, underneath it); `Alt+F6` is the
 same hide on a key. Both are unreliable on the development rig, so use `Alt+F12` for comparisons.
+An fps counter is always shown at the top right of the DLSS 5 image: it counts frames actually presented to
+the monitor. Steam's counter is drawn into the game's own frame, underneath the DLSS 5 image, so it is hidden.
+
 Use a Windows screenshot (`Win+PrtScn` or the Snipping Tool). Steam's and ReShade's screenshot keys capture the
 game's own frame, which is likely to miss the DLSS 5 image laid over it.
 
