@@ -48,6 +48,7 @@ bool gLog = true;
 bool gHideNvidia = true;
 bool gHideWarp = true;
 bool gMaskDxr = false;
+bool gPreloadNvapiGate = true;
 
 // ---------------------------------------------------------------- log
 
@@ -409,6 +410,41 @@ void readSettings()
     gHideNvidia = GetPrivateProfileIntW(L"sl-standin", L"HideNvidia", 1, ini) != 0;
     gHideWarp = GetPrivateProfileIntW(L"sl-standin", L"HideWarp", 1, ini) != 0;
     gMaskDxr = GetPrivateProfileIntW(L"sl-standin", L"MaskDXR", 0, ini) != 0;
+    gPreloadNvapiGate = GetPrivateProfileIntW(L"sl-standin", L"PreloadNvapiGate", 1, ini) != 0;
+}
+
+// ---------------------------------------------------------------- NVAPI gate preload
+//
+// nvapi-gate (tools/nvapi-gate) is installed beside the exe as nvapi64.dll so that the game
+// is refused NVAPI. Measured 2026-10-07: it never loaded. The process held only
+// System32\nvapi64.dll (+ the driver's nvapi64_impl.dll), loaded by something before the
+// game's own LoadLibrary("nvapi64.dll") - and once a module with that base name is loaded,
+// a by-name load returns it, whatever folder it came from. So the game saw NVIDIA through
+// NVAPI, and with MaskDXR=0 it failed "Ray Tracing initialization".
+//
+// The exe imports this DLL statically, so it loads before nearly everything else. Loading
+// the gate by full path here makes it the first nvapi64.dll in the process; later by-name
+// loads get the gate, which refuses game-side callers and passes NVIDIA's own components,
+// the bridge add-on and the DLSS-NR snippet through to the real one. The gate's own
+// DllMain only opens its log, and it imports nothing but kernel32, which is what makes a
+// load from here acceptable.
+void preloadNvapiGate()
+{
+    if (!gPreloadNvapiGate) return;
+    const bool realFirst = GetModuleHandleW(L"nvapi64.dll") != nullptr;
+    wchar_t gate[MAX_PATH * 2];
+    swprintf(gate, MAX_PATH * 2, L"%snvapi64.dll", gDir);
+    if (GetFileAttributesW(gate) == INVALID_FILE_ATTRIBUTES)
+    {
+        logf("PreloadNvapiGate: no nvapi64.dll beside sl-standin - nothing to preload");
+        return;
+    }
+    HMODULE h = LoadLibraryExW(gate, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    HMODULE byName = GetModuleHandleW(L"nvapi64.dll");
+    logf("PreloadNvapiGate: %s (error %lu)%s; a by-name nvapi64.dll now resolves to the %s",
+         h ? "loaded the gate" : "load FAILED", h ? 0ul : GetLastError(),
+         realFirst ? " - System32's nvapi64.dll was ALREADY loaded, so the gate may be bypassed" : "",
+         (h && byName == h) ? "gate" : "real NVAPI");
 }
 
 }  // namespace
@@ -645,7 +681,9 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
             FILE *f = nullptr;   // one launch per log
             if (_wfopen_s(&f, gLogPath, L"w") == 0 && f) fclose(f);
         }
-        logf("sl-standin (nr-bridge) loaded. HideNvidia=%d HideWarp=%d MaskDXR=%d", gHideNvidia, gHideWarp, gMaskDxr);
+        logf("sl-standin (nr-bridge) loaded. HideNvidia=%d HideWarp=%d MaskDXR=%d PreloadNvapiGate=%d",
+             gHideNvidia, gHideWarp, gMaskDxr, gPreloadNvapiGate);
+        preloadNvapiGate();
     }
     return TRUE;
 }
