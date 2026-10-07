@@ -192,9 +192,11 @@ game's own frame, which is likely to miss the DLSS 5 image laid over it.
 - **Ray tracing costs game fps.** Ray tracing works (it runs on the AMD card), but it lowers the game's own frame
   rate as usual; see [`docs/rt-init-error.md`](docs/rt-init-error.md) for how it was made to work.
 - **Windowed or borderless only.** Exclusive fullscreen can't work: the game renders on the AMD card while the
-  monitor is on the NVIDIA one, and the DLSS 5 image is composed onto the game's window. Use borderless; the
-  DLSS 5 image is stretched to fill it (`OverlayScale=1`). A game resolution with the monitor's shape (for
-  example 2560x1600 on a 16:10 screen) avoids distortion.
+  monitor is on the NVIDIA one, and the DLSS 5 image is composed onto the game's window. In borderless mode
+  Cyberpunk sizes its window to the game's resolution, not the monitor's, and the DLSS 5 image can only fill that
+  window. To fill the screen, set **Windows' display resolution to the game's resolution** (tested: 2560x1600 on
+  a 2880x1800 monitor, about 70 fps), or run the game at the monitor's native resolution (slower DLSS 5 pass).
+  Restart the game after changing the window mode or resolution, so DLSS 5 starts at the new size.
 - **Single monitor, on the NVIDIA card.** Not tested: HDR, multiple monitors, frame generation.
 - **Latency.** The second card adds latency (34 ms median hand-off, plus the DLSS 5 pass). Fine for single
   player; not intended for competitive play.
