@@ -1,0 +1,106 @@
+name: build
+
+# Every push to main: build everything and keep the result as a workflow artifact (also a compile check).
+# A tag v*: build, then publish a GitHub Release with a ready-to-use zip.
+# The zip holds this repository's files plus the three DLLs tools\deploy.ps1 installs. It never contains
+# NVIDIA's or RTInitFix's files: users supply those (vendor/README.md).
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same scripts as a local build: pinned NGX + ReShade headers, then MSVC + Ninja via vcvars64.
+      - name: Fetch pinned headers
+        shell: pwsh
+        run: tools\fetch-deps.ps1
+
+      - name: Build
+        shell: pwsh
+        run: tools\build.ps1
+
+      - name: Check the deploy set was produced
+        shell: pwsh
+        run: |
+          $need = 'build\bridge\mgpu_bridge.addon64', 'build\sl-standin\sl.interposer.dll', 'build\nvapi-gate\nvapi64.dll'
+          foreach ($f in $need) {
+            if (-not (Test-Path $f)) { throw "missing $f" }
+            "{0,-40} {1,10:N0} bytes" -f $f, (Get-Item $f).Length
+          }
+
+      - name: Stage release zip
+        id: stage
+        shell: pwsh
+        run: |
+          $name = if ($env:GITHUB_REF_TYPE -eq 'tag') { "NR-RedGreen-$($env:GITHUB_REF_NAME)" } else { "NR-RedGreen-$($env:GITHUB_SHA.Substring(0,7))" }
+          $stage = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          # The repository's tracked files (scripts, assets, docs, licences), exactly as committed.
+          git archive --format=zip -o "$env:RUNNER_TEMP\src.zip" HEAD
+          Expand-Archive "$env:RUNNER_TEMP\src.zip" $stage
+          # The three built DLLs, where tools\deploy.ps1 looks for them. Copied after the sources, so they
+          # are newer than tools\sl-standin\*.cpp and deploy's staleness check passes.
+          foreach ($f in 'build\bridge\mgpu_bridge.addon64', 'build\sl-standin\sl.interposer.dll', 'build\nvapi-gate\nvapi64.dll') {
+            $to = Join-Path $stage $f
+            New-Item -ItemType Directory -Force (Split-Path $to) | Out-Null
+            Copy-Item $f $to
+          }
+          $zip = Join-Path $env:RUNNER_TEMP "$name.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "zip=$zip"  >> $env:GITHUB_OUTPUT
+          Get-Item $zip | Select-Object Name, Length
+
+      - name: Keep as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.stage.outputs.name }}
+          path: ${{ steps.stage.outputs.zip }}
+          retention-days: 30
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'EOF'
+          Ready-built NR-RedGreen. No Visual Studio needed.
+
+          1. Extract the zip somewhere outside the game folder.
+          2. Put the files listed in `vendor/README.md` into `vendor\` (NVIDIA's DLSS 5 neural-rendering
+             runtime and RTInitFix's Aftermath stub; they are not included and never will be).
+          3. Install ReShade with add-on support into Cyberpunk 2077.
+          4. In PowerShell, in the extracted folder: `tools\deploy.ps1`, then `tools\launch.ps1`.
+             If Windows blocks the scripts because they were downloaded, run
+             `Get-ChildItem -Recurse | Unblock-File` in that folder once.
+
+          See the README for requirements, hotkeys and troubleshooting. Single-player only, at your own risk.
+          EOF
+          gh release create "$GITHUB_REF_NAME" dist/*.zip --title "NR-RedGreen $GITHUB_REF_NAME" --notes-file notes.md

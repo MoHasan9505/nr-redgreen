@@ -89,20 +89,25 @@ needs them and the game only produces them for FSR.
 - The DLSS 5 neural-rendering runtime, `nvngx_dlssnr.dll`. You must supply it yourself: it is not part of the
   NVIDIA driver, and this project does not distribute it. See [`vendor/README.md`](vendor/README.md).
 
-**To build**
+**To build it yourself** (not needed with a release download)
 - Visual Studio 2022 (or Build Tools) with the "Desktop development with C++" workload, which includes CMake
   and Ninja.
 - Internet access the first time, to download the pinned NVIDIA NGX and ReShade headers.
 
 ## Installation
 
-Run these in PowerShell from the repository folder.
+Run these in PowerShell from the project folder.
 
-1. **Get the headers and build:**
-   ```powershell
-   tools\fetch-deps.ps1     # once: NVIDIA NGX + ReShade headers into third_party\
-   tools\build.ps1          # the add-on and every tool, into build\<name>\
-   ```
+1. **Get the built add-on**, either way:
+   - **Download** the latest zip from [Releases](https://github.com/MoHasan9505/nr-redgreen/releases) and extract
+     it outside the game folder. It contains the add-on, sl-standin and the NVAPI gate already built. If Windows
+     blocks the scripts because they were downloaded, run `Get-ChildItem -Recurse | Unblock-File` in the folder
+     once.
+   - **Or build it yourself** (needs Visual Studio, see [Requirements](#requirements)):
+     ```powershell
+     tools\fetch-deps.ps1     # once: NVIDIA NGX + ReShade headers into third_party\
+     tools\build.ps1          # the add-on and every tool, into build\<name>\
+     ```
 2. **Supply the third-party files** listed in [`vendor/README.md`](vendor/README.md), in `vendor\nvidia\` and
    `vendor\rtinitfix\`.
 3. **Install ReShade with add-on support** into Cyberpunk 2077 (`bin\x64\Cyberpunk2077.exe`, DirectX 12).
