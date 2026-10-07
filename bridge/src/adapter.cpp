@@ -49,6 +49,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "adapter.hpp"
@@ -92,6 +93,7 @@ namespace
         std::mutex cs;
         std::vector<entry> table;
         bool table_enumerated = false;      // sticky: first successful pass
+        std::vector<std::pair<LUID, LUID>> dup_alias;   // [NRB21] dropped duplicate -> kept entry
         bool provisional_known = false;     // first init_device's LUID
         LUID provisional_luid{};
         bool decided = false;               // selected or terminally refused
@@ -247,7 +249,8 @@ namespace
     // GPUs. When two hardware entries agree on vendor, device, subsystem, revision and dedicated
     // VRAM, keep the one DXCore lists and drop the other. Both or neither listed: keep both, and
     // the refusal stands.
-    void drop_duplicate_gpus(std::vector<IDXGIAdapter1 *> &found, const std::vector<LUID> &dxcore_luids)
+    void drop_duplicate_gpus(std::vector<IDXGIAdapter1 *> &found, const std::vector<LUID> &dxcore_luids,
+                             std::vector<std::pair<LUID, LUID>> &aliases)
     {
         auto in_dxcore = [&](const LUID &l) {
             for (const LUID &x : dxcore_luids) if (luid_eq(x, l)) return true;
@@ -283,6 +286,7 @@ namespace
                          "(same vendor, device, subsystem, revision, VRAM; only the latter is in DXCore) - dropped",
                          (unsigned)gone.HighPart, (unsigned)gone.LowPart, (unsigned)kept.HighPart, (unsigned)kept.LowPart);
                 mgpu::diag::info(line);
+                aliases.push_back({gone, kept});   // [NRB21]
                 found[drop]->Release();
                 found.erase(found.begin() + (std::ptrdiff_t)drop);
                 if (drop == i) { --i; break; }
@@ -323,7 +327,8 @@ namespace
         }
         std::vector<LUID> dxcore_luids;
         add_hidden_adapters(factory, found, dxcore_luids);   // nr-bridge [NRB5]
-        drop_duplicate_gpus(found, dxcore_luids);            // nr-bridge [NRB8]
+        S.dup_alias.clear();
+        drop_duplicate_gpus(found, dxcore_luids, S.dup_alias);   // nr-bridge [NRB8]
 
         for (UINT i = 0; i < (UINT)found.size(); ++i)
         {
@@ -461,9 +466,28 @@ namespace
             return;   // the failure was logged at the enumeration site
 
         // == the swapchain LUID, by the gate above.
-        const LUID game = S.result.game_luid;
+        LUID game = S.result.game_luid;
 
         char line[512];
+
+        // nr-bridge [NRB21]. The game may create its device on the DXGI entry NRB8 dropped as a
+        // duplicate: 2026-10-07, with NVAPI refused to the game, it rendered on the R9700's second
+        // LUID (...1F81B) while the table kept ...10302, and this selection refused. A dropped
+        // duplicate is the same physical GPU as the entry it duplicates, so match on that entry.
+        // Only the matching here changes: result.game_luid keeps the swapchain's own LUID, which is
+        // what the game-device checks elsewhere compare against.
+        for (const auto &al : S.dup_alias)
+        {
+            if (!luid_eq(al.first, game)) continue;
+            snprintf(line, sizeof line,
+                     "[MGPU][NRB21] game luid=0x%08X-0x%08X is the duplicate DXGI entry NRB8 dropped; "
+                     "matching it as the same GPU at luid=0x%08X-0x%08X",
+                     (unsigned)game.HighPart, (unsigned)game.LowPart,
+                     (unsigned)al.second.HighPart, (unsigned)al.second.LowPart);
+            mgpu::diag::info(line);
+            game = al.second;
+            break;
+        }
 
         // [rule 3] the software filter, plus exclusion of the game's own
         // adapter (a LUID match, never an index match).

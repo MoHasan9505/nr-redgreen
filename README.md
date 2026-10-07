@@ -237,7 +237,7 @@ with its reason and measurements.
 | Document | Contents |
 |---|---|
 | [`docs/how-it-works.md`](docs/how-it-works.md) | Plain-English overview |
-| [`docs/bridge-changes.md`](docs/bridge-changes.md) | Every change to the bridge (NRB1-NRB20) and why |
+| [`docs/bridge-changes.md`](docs/bridge-changes.md) | Every change to the bridge (NRB1-NRB21) and why |
 | [`docs/test-log.md`](docs/test-log.md) | Test runs 13-32: what was measured and what changed because of it |
 | [`docs/measurements.md`](docs/measurements.md) | Probe measurements (DLSS 5 cost per resolution, PCIe transport) and project history |
 | [`docs/test-system.md`](docs/test-system.md) | The PC, drivers and game version the results were measured on |
