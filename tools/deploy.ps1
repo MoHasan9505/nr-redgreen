@@ -99,7 +99,10 @@ $gate = Join-Path $repo 'build\nvapi-gate\nvapi64.dll'
 foreach ($f in @($addon, $snippet, $gate) + @($replacements.Values)) { if (-not (Test-Path $f)) { throw "missing $f (build with tools\build.ps1; RTInitFix DLLs go in vendor\rtinitfix)" } }
 # A failed build can leave no DLL or a stale one: never install an sl-standin older than its source.
 if (-not $UseRTInitFix) {
-    $src = Get-ChildItem (Join-Path $repo 'tools\sl-standin') -File | Sort-Object LastWriteTime | Select-Object -Last 1
+    # Only what the compiler and linker read: sl-standin.ini is copied, not built, so a newer one must not count.
+    $src = Get-ChildItem (Join-Path $repo 'tools\sl-standin') -File |
+        Where-Object { $_.Extension -in '.cpp', '.h', '.hpp', '.def', '.inc' } |
+        Sort-Object LastWriteTime | Select-Object -Last 1
     if ((Get-Item $interposer).LastWriteTime -lt $src.LastWriteTime) {
         throw "build\sl-standin\sl.interposer.dll is older than tools\sl-standin\$($src.Name) - tools\build.ps1 sl-standin failed or was not run. Fix the build, or deploy with -UseRTInitFix."
     }
