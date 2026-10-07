@@ -435,6 +435,61 @@ bool dcomp_peek_toggle()
     return dcomp_set_rooted(!g_dcomp_rooted, "peek");
 }
 
+// ---- NRB22: SCALE THE VISUAL TO THE GAME'S WINDOW ----
+//
+// The composition swapchain is sized to the game's frame, and the visual had no
+// transform, so DirectComposition drew it 1:1 at the window's top-left. In
+// borderless mode the window is the whole monitor (2880x1800 on the development
+// rig) while the frame was 2560x1440: the neural output covered part of the
+// screen. The game's own swapchain is DXGI_SCALING_STRETCH, so its frame fills
+// the window; the visual now does the same, with a scale transform the
+// compositor applies when it composes - no shader, no extra GPU work here.
+//
+// OverlayScale in mgpu.ini: 1 (default) stretch to the window, 0 off (1:1, the
+// old behaviour). Checked every present against the window's client size, so a
+// resize or a mode switch is followed; a minimised window (0x0) is left alone.
+// Bridge thread only, like every other call on these objects.
+int overlay_scale_setting();   // defined beside ini_read_dcomp_setting
+static void *g_dcomp_scale = nullptr;   // IDCompositionScaleTransform, created on first use
+static UINT g_fit_cw = 0, g_fit_ch = 0, g_fit_sw = 0, g_fit_sh = 0;
+
+static void dcomp_fit_to_window(UINT sw, UINT sh)
+{
+    if (g_dcomp_device == nullptr || g_dcomp_visual == nullptr || g_game_hwnd == nullptr) return;
+    if (sw == 0 || sh == 0 || overlay_scale_setting() == 0) return;
+    RECT rc{};
+    if (!GetClientRect(g_game_hwnd, &rc)) return;
+    const UINT cw = (UINT)(rc.right - rc.left), ch = (UINT)(rc.bottom - rc.top);
+    if (cw == 0 || ch == 0) return;
+    if (cw == g_fit_cw && ch == g_fit_ch && sw == g_fit_sw && sh == g_fit_sh) return;
+    g_fit_cw = cw; g_fit_ch = ch; g_fit_sw = sw; g_fit_sh = sh;
+
+    IDCompositionDevice *dc = (IDCompositionDevice *)g_dcomp_device;
+    IDCompositionVisual *v  = (IDCompositionVisual *)g_dcomp_visual;
+    if (g_dcomp_scale == nullptr)
+    {
+        IDCompositionScaleTransform *t = nullptr;
+        if (FAILED(dc->CreateScaleTransform(&t)) || t == nullptr) return;
+        g_dcomp_scale = t;
+    }
+    IDCompositionScaleTransform *t = (IDCompositionScaleTransform *)g_dcomp_scale;
+    const float sx = (float)cw / (float)sw, sy = (float)ch / (float)sh;
+    HRESULT hr = t->SetCenterX(0.0f);
+    if (SUCCEEDED(hr)) hr = t->SetCenterY(0.0f);
+    if (SUCCEEDED(hr)) hr = t->SetScaleX(sx);
+    if (SUCCEEDED(hr)) hr = t->SetScaleY(sy);
+    if (SUCCEEDED(hr)) hr = v->SetTransform(t);
+    if (SUCCEEDED(hr)) hr = v->SetBitmapInterpolationMode(
+        (cw == sw && ch == sh) ? DCOMPOSITION_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+                               : DCOMPOSITION_BITMAP_INTERPOLATION_MODE_LINEAR);
+    if (SUCCEEDED(hr)) hr = dc->Commit();
+    char l[300];
+    snprintf(l, sizeof l,
+             "[MGPU][NRB22] neural output %ux%u, game window %ux%u -> scale %.4f x %.4f%s (hr=0x%08X)",
+             sw, sh, cw, ch, sx, sy, (cw == sw && ch == sh) ? " (1:1)" : ", linear", (unsigned)hr);
+    if (SUCCEEDED(hr)) mgpu::diag::info(l); else mgpu::diag::error(l);
+}
+
 
 // T5: the present chain (brief section 06). Bridge thread only.
 //
@@ -538,6 +593,9 @@ bool create_present_chain(HWND hwnd)
             ((IDCompositionDevice *)g_dcomp_device)->Commit();
             ((IDCompositionDevice *)g_dcomp_device)->WaitForCommitCompletion();
         }
+        if (g_dcomp_scale != nullptr)   // NRB22
+        { ((IDCompositionScaleTransform *)g_dcomp_scale)->Release(); g_dcomp_scale = nullptr; }
+        g_fit_cw = g_fit_ch = g_fit_sw = g_fit_sh = 0;
         if (g_dcomp_visual != nullptr)
         { ((IDCompositionVisual *)g_dcomp_visual)->Release(); g_dcomp_visual = nullptr; }
         if (g_dcomp_target != nullptr)
@@ -1124,6 +1182,17 @@ void report_process_census_at_arm();
 bool present_frame(float r, float g, float b)
 {
     auto &S = st();
+
+    // NRB22: keep the composition visual scaled to the game's window. A no-op unless
+    // DcompOverlay is composing and the window or chain size changed since the last call.
+    {
+        UINT fw = 0, fh = 0;
+        {
+            std::lock_guard<std::mutex> lk(S.cs);
+            fw = S.chain_w; fh = S.chain_h;
+        }
+        dcomp_fit_to_window(fw, fh);
+    }
 
     ID3D12Device *dev = nullptr;
     ID3D12CommandQueue *queue = nullptr;
@@ -14076,6 +14145,24 @@ static unsigned bridge_attached_outputs()
 // the same screen plus ten seconds of AutoArm hold on every launch for the
 // rest of the product's life is a nag, not advice. A suggestion you cannot
 // decline is a defect.
+// NRB22. OverlayScale: 1 (default, also when absent or unreadable) stretch the
+// visual to the game's window, 0 draw it 1:1. Read once.
+int overlay_scale_setting()
+{
+    static std::atomic<int> latched{-1};
+    int v = latched.load(std::memory_order_relaxed);
+    if (v >= 0) return v;
+    char buf[INI_BYTES];
+    v = 1;
+    if (ini_slurp(buf, sizeof buf))
+    {
+        const char *k = ini_find(buf, "OverlayScale");
+        if (k != nullptr && atoi(k) == 0 && *k == '0') v = 0;
+    }
+    latched.store(v, std::memory_order_relaxed);
+    return v;
+}
+
 static int ini_read_dcomp_setting()
 {
     char buf[INI_BYTES];

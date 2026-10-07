@@ -191,6 +191,10 @@ game's own frame, which is likely to miss the DLSS 5 image laid over it.
 - **FSR required.** Motion vectors and depth come from FSR 3.0 or FSR 4; other upscalers aren't supported.
 - **Ray tracing costs game fps.** Ray tracing works (it runs on the AMD card), but it lowers the game's own frame
   rate as usual; see [`docs/rt-init-error.md`](docs/rt-init-error.md) for how it was made to work.
+- **Windowed or borderless only.** Exclusive fullscreen can't work: the game renders on the AMD card while the
+  monitor is on the NVIDIA one, and the DLSS 5 image is composed onto the game's window. Use borderless; the
+  DLSS 5 image is stretched to fill it (`OverlayScale=1`). A game resolution with the monitor's shape (for
+  example 2560x1600 on a 16:10 screen) avoids distortion.
 - **Single monitor, on the NVIDIA card.** Not tested: HDR, multiple monitors, frame generation.
 - **Latency.** The second card adds latency (34 ms median hand-off, plus the DLSS 5 pass). Fine for single
   player; not intended for competitive play.
@@ -240,7 +244,7 @@ with its reason and measurements.
 | Document | Contents |
 |---|---|
 | [`docs/how-it-works.md`](docs/how-it-works.md) | Plain-English overview |
-| [`docs/bridge-changes.md`](docs/bridge-changes.md) | Every change to the bridge (NRB1-NRB21) and why |
+| [`docs/bridge-changes.md`](docs/bridge-changes.md) | Every change to the bridge (NRB1-NRB22) and why |
 | [`docs/test-log.md`](docs/test-log.md) | Test runs 13-32: what was measured and what changed because of it |
 | [`docs/measurements.md`](docs/measurements.md) | Probe measurements (DLSS 5 cost per resolution, PCIe transport) and project history |
 | [`docs/test-system.md`](docs/test-system.md) | The PC, drivers and game version the results were measured on |
