@@ -172,7 +172,7 @@ game's own frame, which is likely to miss the DLSS 5 image laid over it.
 |---|---|
 | `Cyberpunk 2077 was not found in any Steam library` | Pass `-GameDir "<game folder>"` or set `NRB_GAME_DIR` (see [Installation](#installation)). |
 | `deploy.ps1` reports `missing ...` | Run `tools\build.ps1`, and check the files in [`vendor/README.md`](vendor/README.md). |
-| The game fails with "Ray Tracing initialization" | The NVIDIA card is visible to the game. Re-run `tools\deploy.ps1` and check that `sl-standin.log` exists in `bin\x64`. Background: [`docs/rt-init-error.md`](docs/rt-init-error.md). |
+| The game fails with "Ray Tracing initialization" | The game can see the NVIDIA card. Re-run `tools\deploy.ps1`, then check `bin\x64\sl-standin.log` for `PreloadNvapiGate: loaded the gate`; if it isn't there, set `MaskDXR=1` in `bin\x64\sl-standin.ini` to start the game without ray tracing. Background: [`docs/rt-init-error.md`](docs/rt-init-error.md). |
 | The game runs, but the image is never DLSS 5 | Make sure FSR 3.0 or FSR 4 is selected in game: with any other upscaler the bridge waits for motion vectors that never come. Then check `ReShade.log` for `[MGPU]` errors. |
 | `ERROR 204` or `ERROR 205` in the bridge window | ReShade could not compile the depth shader (check `EffectSearchPaths` in `ReShade.ini`), or `mgpu.ini` is missing (re-run deploy). |
 | The DLSS 5 output never appears, and the log has a `[V49]` line naming the topmost composition slot | Another overlay holds that slot. Close the NVIDIA overlay (and other overlays) first. |
@@ -186,8 +186,8 @@ game's own frame, which is likely to miss the DLSS 5 image laid over it.
   but the scripts and the FSR hooks would need checking for each one.
 - **One machine.** Every result above comes from a single PC (see [`docs/test-system.md`](docs/test-system.md)).
 - **FSR required.** Motion vectors and depth come from FSR 3.0 or FSR 4; other upscalers aren't supported.
-- **No ray tracing.** With an NVIDIA card in the PC, Cyberpunk fails to start ray tracing on the AMD card, so
-  sl-standin reports it as unsupported ([`docs/rt-init-error.md`](docs/rt-init-error.md)).
+- **Ray tracing costs game fps.** Ray tracing works (it runs on the AMD card), but it lowers the game's own frame
+  rate as usual; see [`docs/rt-init-error.md`](docs/rt-init-error.md) for how it was made to work.
 - **Single monitor, on the NVIDIA card.** Not tested: HDR, multiple monitors, frame generation.
 - **Latency.** The second card adds latency (34 ms median hand-off, plus the DLSS 5 pass). Fine for single
   player; not intended for competitive play.
@@ -241,7 +241,7 @@ with its reason and measurements.
 | [`docs/test-log.md`](docs/test-log.md) | Test runs 13-32: what was measured and what changed because of it |
 | [`docs/measurements.md`](docs/measurements.md) | Probe measurements (DLSS 5 cost per resolution, PCIe transport) and project history |
 | [`docs/test-system.md`](docs/test-system.md) | The PC, drivers and game version the results were measured on |
-| [`docs/rt-init-error.md`](docs/rt-init-error.md) | Why Cyberpunk fails to start ray tracing with an NVIDIA card present, and the fix |
+| [`docs/rt-init-error.md`](docs/rt-init-error.md) | Why Cyberpunk failed to start ray tracing with an NVIDIA card present, and how it was fixed |
 
 ## Roadmap
 

@@ -4,7 +4,7 @@ Upstream: MGPU Bridge @ `4f0cf56` (see `bridge/UPSTREAM.md`). Every change is ta
 in code comments and log lines (`[MGPU][NRB<n>]`), so `grep NRB` finds all of them.
 Version string: `0.3.0-discovery-lat+nrb.1`.
 
-The game itself also needs sl-standin (our `sl.interposer.dll`, ray tracing off) and nvapi-gate on this rig - see
+The game itself also needs sl-standin (our `sl.interposer.dll`, which also loads nvapi-gate first) and nvapi-gate on this rig - see
 `rt-init-error.md`. `tools/deploy.ps1` installs both together with the add-on.
 
 | Tag | Where | What and why |

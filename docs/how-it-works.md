@@ -35,7 +35,7 @@ About 28 MB crosses PCIe per frame (image 14.7 MB, motion vectors 6.6 MB, depth 
 | Part | What it does | Why it is needed |
 |---|---|---|
 | **ReShade add-on** | Loads inside the game and sees every finished frame | It is the hook into the game: no game files are modified |
-| **sl-standin** | Hides the NVIDIA card from the game, and hides ray tracing from it | Otherwise the game tries to use the NVIDIA card, or fails to start ray tracing on the AMD one |
+| **sl-standin** | Hides the NVIDIA card from the game, including from NVIDIA's driver interface (NVAPI) | Otherwise the game tries to use the NVIDIA card, or fails to start ray tracing on the AMD one |
 | **FSR tap** | Hooks AMD's FSR upscaler and copies its motion vectors and depth mid-frame | DLSS 5 needs to know how things move and how far away they are, and FSR already has both |
 | **Transport ring** | Six slots in memory both cards can reach, each holding one frame plus an ID "seal" | Lets the R9700 keep producing while the 5070 is still working on an earlier frame |
 | **Copy queue (R9700)** | Does the slow PCIe copy on a separate engine | The game no longer waits for the bus (game fps 64 → ~75) |

@@ -61,7 +61,7 @@ sl-standin exports the same 261 names as RTInitFix (checked against its export t
   the bridge still see the 5070. WARP stays visible, as on an AMD-only machine;
 - with `MaskDXR=1` (the shipped default) reports `RaytracingTier = NOT_SUPPORTED` to the game, as
   RTInitFix does. **Run10: with `MaskDXR=0` the RT-init error came back even with NVIDIA hidden from
-  the game**, so hiding the adapter is not enough and ray tracing stays off for now;
+  the game**, so hiding the adapter seemed not to be enough and ray tracing stayed off (until the NVAPI root cause, below);
 - answers every `sl*` call with RTInitFix's values (`slInit` returns 4: Streamline off);
 - forwards the 229 `vk*` names to `vulkan-1.dll`;
 - logs every factory and device creation to `sl-standin.log` beside it.
@@ -79,7 +79,27 @@ The bridge then refused to pick a neural GPU: DXGI listed the 5070 twice (NRB8 i
 
 Since run12 the game starts every time with sl-standin, and every in-game run since (13-32) used it.
 
-## Still open: ray tracing
+## Root cause and fix: NVAPI (2026-10-07)
 
-Ray tracing stays off in the game (`MaskDXR=1`). Run10 showed that hiding the NVIDIA card alone is not enough,
-so getting ray tracing back on the R9700 needs a different approach and has not been attempted since.
+Ray tracing was forced off (`MaskDXR=1`) from run10 until 2026-10-07. The cause turned out to be **NVAPI**,
+NVIDIA's driver interface:
+
+- `nvapi-gate` (our stand-in `nvapi64.dll` in `bin\x64`) is meant to refuse NVAPI to the game, but it never
+  loaded: the process held only `System32\nvapi64.dll` (+ the driver's `nvapi64_impl.dll`), loaded before
+  the game's own by-name request. Once a module named `nvapi64.dll` is loaded, Windows hands that one to every
+  later by-name load. No `nvapi-gate.log` was ever written.
+- So the game could still detect the NVIDIA card through NVAPI, and with ray tracing allowed it failed
+  "Ray Tracing initialization" on the AMD card. A user report on the RTInitFix page (9070 XT + RTX 3070)
+  pointed the same way: the mod's `nvapi64.dll` alone fixed it with ray tracing on.
+
+**Fix:** sl-standin, which the exe imports and so loads before nearly everything else, now loads the gate from
+`bin\x64` first (`PreloadNvapiGate=1`). Every later by-name `nvapi64.dll` load gets the gate, which refuses the
+game and passes NVIDIA's own components, the bridge and the DLSS-NR snippet through. With that, `MaskDXR=0`
+starts and ray tracing runs on the R9700 with DLSS 5 on the 5070.
+
+One side effect: with NVAPI refused, the game created its device on the R9700's **second** DXGI entry, the one
+NRB8 drops as a duplicate, and the bridge refused to select a GPU. NRB21 matches the game through dropped
+duplicates (`docs/bridge-changes.md`).
+
+`MaskDXR=0` is now the shipped default. `MaskDXR=1` with `PreloadNvapiGate=0` restores the old, ray-tracing-off
+behaviour.
