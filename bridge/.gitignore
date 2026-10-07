@@ -1,0 +1,11 @@
+# CI-fetched ReShade headers — created at build time by .github/workflows/build.yml
+# from crosire/reshade at the pinned SHA recorded in VENDOR_LOCK.md. Never committed.
+ext/
+
+# CMake build output
+build/
+
+# CI download scratch (codeload tarball). The fetch step keeps downloads in
+# the workspace rather than /tmp: MSYS path translation on Windows runners
+# makes /tmp unreliable for curl/tar arguments.
+_dl/

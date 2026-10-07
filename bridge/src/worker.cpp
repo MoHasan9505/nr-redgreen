@@ -1,0 +1,1503 @@
+// MGPU Bridge - the bridge thread (T3; window + message pump arrive with T4)
+//
+// Thread creation uses _beginthreadex, not CreateThread: this thread uses
+// CRT facilities (snprintf, std::mutex, std::atomic), and CreateThread
+// skips the per-thread CRT initialization. Signature (6 arguments):
+//   uintptr_t _beginthreadex(void *security, unsigned stack_size,
+//       unsigned (__stdcall *start_address)(void *), void *arglist,
+//       unsigned initflag, unsigned *thrdaddr);
+//
+// The one-shot re-arms: UE5's probe cycles tear the device down two or
+// three times before the real render device appears, and ReShade sometimes
+// re-attaches the module without a fresh LoadLibrary ("Loading externally
+// registered add-on") - statics such as `started` survive. A thread that
+// exited on a probe's teardown would otherwise never be replaced, and the
+// T2 selection (now deferred to the real device's swapchain) would have no
+// thread left to create the T3 device.
+//
+// T4: the window and the message pump. A window belongs to the thread that
+// called CreateWindowExW, and only that thread may pump its messages - so
+// register class, create window, PeekMessage/DispatchMessage, DestroyWindow
+// and UnregisterClass all happen on this thread. Nothing touches the window
+// from a ReShade callback, and nothing blocks the game thread waiting on it.
+// The stop event is the single shutdown signal for this thread; WM_QUIT is
+// never the exit signal (a WM_QUIT in the queue would be drained and
+// dispatched to nothing, and the loop would keep waiting - a hang with no
+// error anywhere). The device-removal poll T3 never built is folded into the
+// pump loop: a 250 ms timed wait that calls gpu1::device_removed_reason and
+// logs only on the transition away from S_OK (the value is sticky once
+// removed).
+#include <windows.h>
+#include <process.h>
+// P7.10: IDXGIAdapter1::EnumOutputs and DXGI_OUTPUT_DESC, to ask the BRIDGE
+// adapter which panels it drives instead of asking Windows where it happened to
+// put our window. dxgi1_4.h is what adapter.cpp already includes, so the two
+// files agree on the DXGI surface level.
+#include <dxgi1_4.h>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <mutex>
+
+#include "adapter.hpp"
+#include "diag.hpp"
+#include "gpu1_context.hpp"
+#include "worker.hpp"
+
+// T4 (brief section 00, exception 1): the add-on's own module handle,
+// defined in dllmain.cpp and captured at DLL_PROCESS_ATTACH.
+// GetModuleHandle(nullptr) returns the game's module, not ours, so the
+// window class's hInstance must be this handle.
+// P1.3g. Hotkey id, process-unique. RegisterHotKey(nullptr, id, ...) scopes the
+// id to the calling THREAD, so a collision is only possible with ourselves.
+#define MGPU_HOTKEY_ID 0x4D47   // 'MG'
+// P6.3. Three more, ids adjacent to the first so a collision report names the
+// block rather than a lone key. CTRL+ALT is kept as the modifier for the same
+// reason it was chosen for F10: a bare function key is claimed by games freely,
+// and ReShade owns Home. F12 is deliberately avoided - debuggers take it.
+#define MGPU_HOTKEY_INT_TARGET 0x4D48   // CTRL+ALT+F8  - cycle which pass
+#define MGPU_HOTKEY_INT_DOWN   0x4D49   // CTRL+ALT+F9  - one step down
+#define MGPU_HOTKEY_INT_UP     0x4D4A   // CTRL+ALT+F11 - one step up
+// P7.4: ALT+F7 (NRB19; upstream CTRL+ALT+F7) cycles the view - output, input, split. On the hotkey and
+// not only in the panel because the panel is the ReShade overlay, and opening
+// the overlay to change the view puts the overlay in the shot. The comparison
+// has to be filmable without the instrument on screen.
+#define MGPU_HOTKEY_VIEW       0x4D4B   // ALT+F7 (NRB19; upstream CTRL+ALT+F7) - cycle present mode
+// P7.5: the seam, moved with nothing on screen but the game. Four ids rather
+// than one plus a modifier read at press time, because RegisterHotKey delivers
+// only the exact combination it was registered for - a SHIFT held over
+// CTRL+ALT+LEFT does not arrive as CTRL+ALT+LEFT, it arrives as nothing.
+#define MGPU_HOTKEY_SEAM_L     0x4D4C   // CTRL+ALT+LEFT
+#define MGPU_HOTKEY_SEAM_R     0x4D4D   // CTRL+ALT+RIGHT
+#define MGPU_HOTKEY_SEAM_LC    0x4D4E   // CTRL+ALT+SHIFT+LEFT  (coarse)
+#define MGPU_HOTKEY_SEAM_RC    0x4D4F   // CTRL+ALT+SHIFT+RIGHT (coarse)
+// V52: ALT+F6 (NRB19; upstream CTRL+ALT+F6) unroots the composition visual and roots it again. With
+// DcompOverlay=1 the bridge is the TOPMOST visual on the game's window, so the
+// game's own ReShade overlay is drawn underneath it - correctly, and
+// invisibly. This gets out of its way without touching the stream. REGISTERED
+// ONLY IN THAT MODE: in mode 0 nothing is covering the overlay, and an add-on
+// that silently claims a process-wide hotkey for a key that does nothing is
+// not "no regression".
+// F6 and not F12 because Steam's screenshot key is F12.
+#define MGPU_HOTKEY_PEEK       0x4D50   // ALT+F6 (NRB19; upstream CTRL+ALT+F6)
+// NRB19. F6 and F7 moved to plain ALT: on the development rig CTRL+ALT+F6 never
+// arrived (another program can claim a global combination first), and ALT+F6/F7
+// are one hand on a keyboard while the other holds the mouse for a screenshot.
+
+namespace mgpu { HMODULE module_handle(); }
+
+namespace mgpu::worker
+{
+namespace
+{
+    struct state
+    {
+        std::atomic<bool> started{false};
+        std::mutex cs;
+        HANDLE stop_event = nullptr;
+        HANDLE thread = nullptr;
+        DWORD thread_id = 0;
+    };
+
+    state &st()
+    {
+        static state s;
+        return s;
+    }
+
+    // The thread has finished: reset the stop event and re-arm the
+    // one-shot so a later device/swapchain event can spawn a fresh bridge
+    // thread. The stop event is Reset, not Close: it must be unset for the
+    // re-armed thread's first wait, and keeping it live means stop()
+    // (signal-only, from the game thread or DllMain) never touches a
+    // closed handle. The ready event is reset by adapter::shutdown(), so a
+    // re-armed thread cannot wake on this run's stale selection either.
+    void rearm()
+    {
+        std::lock_guard<std::mutex> lk(st().cs);
+        if (st().stop_event != nullptr)
+            ResetEvent(st().stop_event);
+        // _beginthreadex returns a handle the caller owns; dropping the
+        // pointer does not release it. UE5 loads and unloads the add-on
+        // once per adapter probe - five cycles per launch on this rig - so
+        // an unclosed handle here is a per-launch leak, not a theoretical
+        // one. Closing our own handle from inside the thread it refers to
+        // is safe: the handle keeps the kernel object alive independently
+        // of the thread, and nothing waits on it (see stop(): the teardown
+        // is signal-only and never joins).
+        if (st().thread != nullptr)
+        {
+            CloseHandle(st().thread);
+            st().thread = nullptr;
+        }
+        st().thread_id = 0;
+        st().started = false;
+    }
+
+    // T4, requirement 4: the window procedure stays minimal. WM_CLOSE and
+    // WM_DESTROY signal the same shutdown path the add-on unload uses
+    // (worker::stop - signal only, never waits). Everything else is passed
+    // to DefWindowProcW. The user closing this window must not close the
+    // game: we signal our own shutdown, tear down our side (in the ordered
+    // teardown after the loop exits), and leave the game running. No
+    // rendering, no D3D calls, no logging beyond these two messages.
+    //
+    // WM_CLOSE is handled here (not by DefWindowProcW) so the system does
+    // not DestroyWindow immediately: the window is destroyed by the ordered
+    // teardown on this same thread, which is what keeps "no DestroyWindow
+    // failure in the log" true.
+    LRESULT CALLBACK bridge_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        (void)wParam; (void)lParam;
+        switch (msg)
+        {
+        case WM_CLOSE:
+            mgpu::diag::info("[MGPU][T4] WM_CLOSE - the bridge window was closed by the user; "
+                             "signalling bridge shutdown (the game is not affected)");
+            stop();
+            return 0;
+        case WM_DESTROY:
+            mgpu::diag::info("[MGPU][T4] WM_DESTROY - the bridge window was destroyed; "
+                             "signalling bridge shutdown (the game is not affected)");
+            stop();
+            return 0;
+        default:
+            return DefWindowProcW(hWnd, msg, wParam, lParam);
+        }
+    }
+
+    // ---- P7.10: where the window is born ----
+    //
+    // THE DEFECT. The window was created at CW_USEDEFAULT and the P7.3 fit code
+    // then called MonitorFromWindow to learn which panel it had landed on. That
+    // is an inference from where Windows happened to place it, and Windows
+    // places it on the primary display - which on the rig this was built on is
+    // the GAME's panel. So the window sized itself correctly to the wrong
+    // monitor, every launch, and had to be dragged across by hand. It is not
+    // cosmetic: presenting GPU 1's output on GPU 0's panel is the cross-adapter
+    // present the whole topology exists to avoid, and it puts the thing being
+    // measured behind the thing being measured.
+    //
+    // THE FIX. The bridge adapter knows which outputs it drives. Ask it. That
+    // is a statement about the hardware rather than a guess about window
+    // placement, and it is the same adapter pointer T2 selected and T3 created
+    // the device on, so the window cannot end up on a different card than the
+    // neural work by construction.
+    //
+    // Everything here can only withhold a placement, never produce a wrong one:
+    // any failure leaves the origin at CW_USEDEFAULT, which is exactly the old
+    // behaviour, and says so in the log.
+    // The desktop's own monitor list, used when the adapter will not name its
+    // outputs. EnumDisplayMonitors reports what the desktop actually spans,
+    // which is independent of how DXGI attributes outputs to adapters.
+    struct desktop_monitors
+    {
+        RECT rect[8]{};
+        bool primary[8]{};
+        UINT count = 0;
+    };
+
+    BOOL CALLBACK monitor_enum_cb(HMONITOR mh, HDC, LPRECT, LPARAM lp)
+    {
+        desktop_monitors *d = reinterpret_cast<desktop_monitors *>(lp);
+        if (d->count >= 8) return FALSE;
+        MONITORINFO mi{}; mi.cbSize = sizeof mi;
+        if (GetMonitorInfoW(mh, &mi) != FALSE)
+        {
+            d->rect[d->count]    = mi.rcMonitor;
+            d->primary[d->count] = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+            ++d->count;
+        }
+        return TRUE;
+    }
+
+    void enumerate_desktop_monitors(desktop_monitors &out)
+    {
+        EnumDisplayMonitors(nullptr, nullptr, monitor_enum_cb,
+                            reinterpret_cast<LPARAM>(&out));
+    }
+
+    struct bridge_placement
+    {
+        bool known = false;
+        int  x = CW_USEDEFAULT, y = CW_USEDEFAULT;
+        UINT outputs_total = 0;      // outputs the adapter reports
+        UINT outputs_attached = 0;   // of those, attached to the desktop
+        char detail[320] = {};
+    };
+
+    void pick_bridge_placement(const mgpu::adapter::selection_result &sel,
+                               bridge_placement &out)
+    {
+        const int want = mgpu::gpu1::monitor_index();   // -1 = auto
+
+        IDXGIAdapter1 *ad1 = static_cast<IDXGIAdapter1 *>(sel.selected_adapter);
+        if (ad1 == nullptr)
+        {
+            snprintf(out.detail, sizeof out.detail,
+                     "no adapter reference - window placed by Windows (CW_USEDEFAULT)");
+            return;
+        }
+
+        // Collect the adapter's outputs that are actually attached to the
+        // desktop. An output that exists but is not attached has no desktop
+        // rectangle to place a window in, so it is counted and skipped.
+        RECT rects[8]{};
+        char names[8][40]{};
+        UINT n_attached = 0;
+
+        for (UINT i = 0; i < 32; ++i)
+        {
+            IDXGIOutput *o = nullptr;
+            if (FAILED(ad1->EnumOutputs(i, &o)) || o == nullptr)
+                break;   // DXGI_ERROR_NOT_FOUND: this adapter has no more
+            ++out.outputs_total;
+            DXGI_OUTPUT_DESC d{};
+            if (SUCCEEDED(o->GetDesc(&d)) && d.AttachedToDesktop && n_attached < 8)
+            {
+                rects[n_attached] = d.DesktopCoordinates;
+                WideCharToMultiByte(CP_UTF8, 0, d.DeviceName, -1,
+                                    names[n_attached], 39, nullptr, nullptr);
+                names[n_attached][39] = '\0';
+                ++n_attached;
+            }
+            o->Release();
+        }
+        out.outputs_attached = n_attached;
+
+        if (n_attached == 0)
+        {
+            // DXGI SAYS THIS ADAPTER DRIVES NOTHING. Believe it about the
+            // adapter; do not believe it about the machine.
+            //
+            // Measured on the development rig: a second card with a monitor
+            // physically attached and lit reported outputs=0 through
+            // EnumOutputs, while the render adapter reported outputs=2. DXGI
+            // attributes outputs to the adapter that owns the desktop
+            // composition for them, which on a multi-GPU desktop is not
+            // reliably the card the cable is in. So the adapter path is the
+            // preferred answer and NOT the only one - when it comes back
+            // empty, fall through to the desktop's own monitor list.
+            //
+            // The fallback deliberately does NOT try to work out which card
+            // owns which panel, because that is the question DXGI just failed
+            // to answer. It uses the only thing that is reliably true: the
+            // bridge window should not open on the display the game is using.
+            // On a two-monitor rig that is one candidate, which is the whole
+            // problem people actually have.
+            desktop_monitors mons;
+            enumerate_desktop_monitors(mons);
+
+            if (mons.count == 0)
+            {
+                snprintf(out.detail, sizeof out.detail,
+                         "the bridge adapter reports no attached output (%u reported) and no "
+                         "desktop monitor could be enumerated either - window placed by Windows",
+                         out.outputs_total);
+                return;
+            }
+
+            UINT pick = 0;
+            const char *how = nullptr;
+            if (want >= 0 && (UINT)want < mons.count)
+            {
+                pick = (UINT)want;
+                how = "Monitor= from mgpu.ini, indexing DESKTOP monitors (the adapter reported "
+                      "none of its own)";
+            }
+            else
+            {
+                // First non-primary monitor. The game is on the primary one on
+                // essentially every rig this will meet, and "not where the game
+                // is" is the requirement - not "which card owns it".
+                bool found = false;
+                for (UINT i = 0; i < mons.count; ++i)
+                    if (!mons.primary[i]) { pick = i; found = true; break; }
+                if (!found)
+                {
+                    snprintf(out.detail, sizeof out.detail,
+                             "the bridge adapter reports no attached output and this desktop has "
+                             "only one monitor - running HEADLESS or single-screen. This works, "
+                             "but a monitor on the second card was worth +33%% throughput and "
+                             "roughly half the latency on the rig this was measured on. Window "
+                             "placed by Windows");
+                    return;
+                }
+                how = "auto, from the DESKTOP monitor list because the bridge adapter reported "
+                      "no outputs of its own: the first non-primary monitor";
+            }
+
+            out.known = true;
+            out.x = (int)mons.rect[pick].left;
+            out.y = (int)mons.rect[pick].top;
+            snprintf(out.detail, sizeof out.detail,
+                     "%s - monitor %u of %u, rect (%d,%d)-(%d,%d). CHECK THIS ONE: it is placed "
+                     "away from the primary display, not proven to be on the second card, because "
+                     "DXGI would not say. Set Monitor=<n> if it picked wrong",
+                     how, pick, mons.count,
+                     (int)mons.rect[pick].left, (int)mons.rect[pick].top,
+                     (int)mons.rect[pick].right, (int)mons.rect[pick].bottom);
+            return;
+        }
+
+        UINT pick = 0;
+        const char *how = "auto: the bridge adapter's first attached output";
+        if (want >= 0)
+        {
+            if ((UINT)want < n_attached)
+            {
+                pick = (UINT)want;
+                how = "Monitor= from mgpu.ini";
+            }
+            else
+            {
+                // Refuse the index, do not silently substitute a different
+                // panel: a setting that quietly does something else is worse
+                // than one that fails loudly.
+                how = "Monitor= in mgpu.ini names an output this adapter does not have - "
+                      "falling back to its first attached output";
+            }
+        }
+
+        out.known = true;
+        out.x = (int)rects[pick].left;
+        out.y = (int)rects[pick].top;
+        snprintf(out.detail, sizeof out.detail,
+                 "%s: output %u of %u attached (%u reported) \"%s\" desktop rect "
+                 "(%d,%d)-(%d,%d) - the window is created ON THE CARD THAT DID THE NEURAL WORK, "
+                 "so nothing crosses back over the link to be displayed",
+                 how, pick, n_attached, out.outputs_total, names[pick],
+                 (int)rects[pick].left, (int)rects[pick].top,
+                 (int)rects[pick].right, (int)rects[pick].bottom);
+    }
+
+    // ---- P7.10: the title bar as the status line ----
+    //
+    // The window is the only surface a user sees without opening an overlay or
+    // reading a log, and it spent every milestone up to here saying the same
+    // eight characters whatever the bridge was doing. Now it answers the two
+    // questions people actually ask of it - is it armed, and is the neural
+    // stage running - plus the one thing that is a hard limit rather than a
+    // setting.
+    void set_window_title(HWND hwnd, unsigned long long frame)
+    {
+        if (hwnd == nullptr) return;
+
+        mgpu::gpu1::ui_state st;
+        mgpu::gpu1::ui_read(st);
+
+        char t[220];
+        if (!st.armed)
+            snprintf(t, sizeof t,
+                     "MGPU Bridge (GPU 1) - NOT ARMED - press CTRL+ALT+F10 in gameplay "
+                     "| D3D12 only");
+        else if (st.summarised)
+            snprintf(t, sizeof t,
+                     "MGPU Bridge (GPU 1) - finished, ran to its bound | D3D12 only");
+        else
+            snprintf(t, sizeof t,
+                     "MGPU Bridge (GPU 1) - armed | x%u | neural %s | %llu frames | D3D12 only",
+                     st.passes, st.neural ? (st.nr_ok ? "ON" : "requested") : "off",
+                     (unsigned long long)st.consumed);
+
+        wchar_t w[220];
+        if (MultiByteToWideChar(CP_UTF8, 0, t, -1, w, 220) != 0)
+            SetWindowTextW(hwnd, w);
+        (void)frame;
+    }
+
+    unsigned __stdcall bridge_main(void *arg)
+    {
+        (void)arg;
+        mgpu::diag::info("[MGPU][T3] bridge thread started - owns all GPU 1 objects "
+                         "(window + message pump arrive with T4)");
+
+        // Wait for the T2 selection, or shutdown. The ready event is
+        // manual-reset, was created on the game thread before this thread
+        // was spawned, and is set only when the selection is *decided* -
+        // an adapter selected, or a terminal refusal logged.
+        const HANDLE wait[2] = { mgpu::adapter::ready_event(), st().stop_event };
+        const DWORD r = WaitForMultipleObjects(2, wait, FALSE, INFINITE);
+
+        if (r != WAIT_OBJECT_0)
+        {
+            mgpu::diag::warn("[MGPU][T3] shutdown before the T2 selection completed - exiting");
+            mgpu::gpu1::shutdown();
+            mgpu::adapter::shutdown();
+            mgpu::diag::info("[MGPU][T3] bridge thread exiting");
+            rearm();
+            return 0;
+        }
+
+        mgpu::adapter::selection_result sel;
+        mgpu::adapter::get_selection(sel);
+        if (sel.valid && sel.selected_adapter == nullptr)
+        {
+            // Stale wake-up: a re-armed thread that saw a prior run's
+            // selection after its adapter reference was released. Refuse
+            // rather than guess - a null adapter would mean
+            // D3D12CreateDevice on the default adapter, the silent
+            // wrong-adapter failure T2 exists to prevent.
+            mgpu::diag::warn("[MGPU][T3] stale selection (no adapter reference) - exiting "
+                             "without creating a device");
+            mgpu::adapter::shutdown();
+            mgpu::diag::info("[MGPU][T3] bridge thread exiting");
+            rearm();
+            return 0;
+        }
+        // T3 gate; every outcome logged. The return value is whether a
+        // device exists now (created, or already present) - T4 gates the
+        // window on it.
+        const bool have_device = mgpu::gpu1::create_device(sel);
+
+        // ---- T4: the window and the message pump (bridge thread only) ----
+        // The window is created only when the device exists - never on a
+        // cycle with no device, and only after create_device returns true.
+        // A window whose thread is about to exit is worse than no window.
+        const DWORD tid = GetCurrentThreadId();
+        char line[320];
+        // The class name embeds the HMODULE so a stale class from an
+        // unmapped module can never be reused (its lpfnWndProc would point
+        // into unmapped memory). A reload at a different base produces a
+        // different name; the same still-mapped module produces the same
+        // name, which is what makes ERROR_CLASS_ALREADY_EXISTS unambiguous.
+        // Two encodings of the same ASCII name: the narrow form feeds the
+        // log lines (diag takes const char *); the wide form is what the
+        // W APIs register, create and unregister (WNDCLASSEXW.lpszClassName
+        // is LPCWSTR - a narrow char[] would not compile). The wide form is
+        // built with MultiByteToWideChar (kernel32, always linked) rather
+        // than StringCchPrintfW (strsafe.lib), which the closed CMakeLists
+        // does not link.
+        char class_name[64];
+        wchar_t class_name_w[64];
+        snprintf(class_name, sizeof class_name, "MGPU_Bridge_Wnd_%p",
+                 (void *)mgpu::module_handle());
+        const int converted = MultiByteToWideChar(CP_UTF8, 0, class_name, -1,
+                                                  class_name_w, 64);
+        if (converted == 0)
+        {
+            // Cannot happen for this ASCII input into a 64-wide buffer, but
+            // if it did, an empty class name would make RegisterClassExW
+            // fail and the stop-and-report path below would catch it.
+            class_name_w[0] = L'\0';
+        }
+
+        bool class_registered = false;
+        HWND hwnd = nullptr;
+        bool pump = false;
+        bool failed_permanently = false;
+        bool have_chain = false;   // T5: the present chain was created
+        bool hotkey_ok = false;            // P1.3g: CTRL+ALT+F10 registered
+        unsigned manual_runs = 0;          // P1.3g: how many on-demand runs so far
+
+        if (have_device)
+        {
+            // Requirement 1: register the window class on the bridge thread,
+            // hInstance = the add-on's own HMODULE (not the game's).
+            WNDCLASSEXW wc{};
+            wc.cbSize = sizeof(wc);
+            wc.style = CS_HREDRAW | CS_VREDRAW;
+            wc.lpfnWndProc = bridge_wndproc;
+            wc.hInstance = mgpu::module_handle();
+            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            wc.hIcon = nullptr;
+            wc.hbrBackground = nullptr;
+            wc.lpszMenuName = nullptr;
+            wc.lpszClassName = class_name_w;
+            wc.hIconSm = nullptr;
+
+            const ATOM atom = RegisterClassExW(&wc);
+            if (atom == 0)
+            {
+                const DWORD gle = GetLastError();
+                if (gle == ERROR_CLASS_ALREADY_EXISTS)
+                {
+                    // Safe to proceed (the class is ours - this same
+                    // still-mapped module registered it on an earlier
+                    // cycle) and a defect report: our teardown missed
+                    // UnregisterClass. Log at error; do not retry, do not
+                    // delete-and-reregister, and do not fall back to a name.
+                    snprintf(line, sizeof line,
+                             "[MGPU][T4] ERROR_CLASS_ALREADY_EXISTS on class \"%s\" - a prior "
+                             "cycle's teardown missed UnregisterClass (same still-mapped module); "
+                             "proceeding with the existing class, thread id 0x%X",
+                             class_name, (unsigned)tid);
+                    mgpu::diag::error(line);
+                    class_registered = true;   // the class exists; teardown will unregister it
+                }
+                else
+                {
+                    // Stop-and-report: any other RegisterClassExW failure.
+                    // No window is created; the wait loop runs with the pump
+                    // branch omitted but keeps the 250 ms timeout (the
+                    // device-removal poll still has to run).
+                    snprintf(line, sizeof line,
+                             "[MGPU][T4] RegisterClassExW failed (GetLastError=%lu) class=\"%s\" "
+                             "thread id 0x%X - no window will be created; P0 cannot proceed past "
+                             "T4 in this run",
+                             (unsigned long)gle, class_name, (unsigned)tid);
+                    mgpu::diag::error(line);
+                    failed_permanently = true;
+                }
+            }
+            else
+            {
+                class_registered = true;
+
+                // Requirement 2: create the window, client area exactly
+                // 1280x720. CreateWindowExW's width/height are the OUTER
+                // dimensions, so compute them with AdjustWindowRect against
+                // the same style - otherwise the client area comes out
+                // smaller than 720 lines by the title bar and borders.
+                //
+                // T5 (brief section 06, gotcha 8): the style drops
+                // WS_THICKFRAME and WS_MAXIMIZEBOX - non-resizable and
+                // non-maximizable, which removes ResizeBuffers from P0
+                // entirely. The identical style value feeds AdjustWindowRect
+                // below: a style change in one place only would silently
+                // break the 1280x720 client rect that T4 fixed (load-bearing
+                // for the flow pyramid's coarsest level).
+                const DWORD wnd_style =
+                    WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
+                RECT rc{0, 0, 1280, 720};
+                AdjustWindowRect(&rc, wnd_style, FALSE);
+                const int width = rc.right - rc.left;
+                const int height = rc.bottom - rc.top;
+
+                // P7.10: the origin comes from the BRIDGE ADAPTER's own output,
+                // not from wherever Windows would have put the window. It is
+                // computed before CreateWindowExW rather than corrected after,
+                // because the P7.3 fit code reads the window's monitor - move
+                // the window later and the size has already been decided
+                // against the wrong panel.
+                bridge_placement place;
+                pick_bridge_placement(sel, place);
+                // Its own buffer: the enclosing `line` is 320 bytes and this
+                // message is longer. A truncated log line is a wrong answer
+                // that looks like a right one - the same reason the P1.3g
+                // hotkey message has a buffer of its own.
+                char pline[420];
+                // V55. Hand the one fact the hint needs to the side that draws
+                // the screen.
+                //
+                // outputs_ATTACHED, not outputs_total. total counts every
+                // output DXGI enumerates for the adapter; attached counts only
+                // those with DXGI_OUTPUT_DESC::AttachedToDesktop. A render card
+                // sitting headless still has physical connectors, so total can
+                // be non-zero on exactly the rig this hint is for - and the
+                // hint would then never appear for the people it was written
+                // for. Headless is attached == 0 and nothing else.
+                mgpu::gpu1::note_bridge_headless(place.outputs_attached == 0);
+
+                snprintf(pline, sizeof pline, "[MGPU][P7.10] window placement - %s", place.detail);
+                if (place.known) mgpu::diag::info(pline);
+                else             mgpu::diag::warn(pline);
+
+                // T5 (section 09): no WS_VISIBLE. A window created visible
+                // takes foreground activation from the game the moment it
+                // appears, and the game's borderless-fullscreen presentation
+                // drops to windowed-with-borders with the taskbar showing.
+                // The window is shown without activation below.
+                // ---- V18: NoActivate. EXPERIMENTAL, OFF BY DEFAULT. ----
+                //
+                // The window is already created hidden and shown with
+                // SW_SHOWNOACTIVATE, so it does not steal foreground when it
+                // APPEARS. But its extended style is 0, which means a CLICK on
+                // it activates it and takes foreground from the game - and a
+                // game that is not foreground stops taking input, pad included.
+                //
+                // WS_EX_NOACTIVATE makes the window refuse activation
+                // altogether: clicks do not bring it forward and the game keeps
+                // the foreground, so keyboard, mouse and XInput keep working
+                // while the bridge output is on screen.
+                //
+                // WS_EX_TOOLWINDOW goes with it to keep the window out of
+                // Alt+Tab, for the same reason - an Alt+Tab that lands on the
+                // bridge window is the same lost foreground by another route.
+                //
+                // AUTO BY DEFAULT, and only in DUPLICATE mode. The style only
+                // matters when the bridge output shares a picture with the game -
+                // in extended mode the two are on different screens and taking
+                // foreground is normal, wanted behaviour. window_no_activate()
+                // decides: NoActivate=0 off, 1 always, 2 auto (the default),
+                // where auto asks QueryDisplayConfig whether one display source
+                // is driving two targets.
+                DWORD ex_style = 0;
+                if (mgpu::gpu1::window_no_activate())
+                {
+                    ex_style = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+                    mgpu::diag::info("[MGPU][T4] the bridge window is created "
+                                     "WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW. It will not take "
+                                     "foreground from the game when clicked and will not appear "
+                                     "in Alt+Tab, so the game keeps keyboard, mouse and pad. "
+                                     "The line above says whether this was forced or detected. "
+                                     "TRADEOFF: the ReShade overlay on THIS window needs focus "
+                                     "to take keyboard, so use the GAME's overlay instead - it "
+                                     "is the same panel.");
+                }
+
+                hwnd = CreateWindowExW(
+                    ex_style,
+                    class_name_w,
+                    L"MGPU Bridge (GPU 1) - starting | D3D12 only",
+                    wnd_style,
+                    place.x, place.y,
+                    width, height,
+                    nullptr, nullptr,
+                    mgpu::module_handle(),
+                    nullptr);
+                if (hwnd == nullptr)
+                {
+                    const DWORD gle = GetLastError();
+                    snprintf(line, sizeof line,
+                             "[MGPU][T4] CreateWindowExW failed (GetLastError=%lu) class=\"%s\" "
+                             "thread id 0x%X - the class is registered but no window exists; P0 "
+                             "cannot proceed past T4 in this run",
+                             (unsigned long)gle, class_name, (unsigned)tid);
+                    mgpu::diag::error(line);
+                    failed_permanently = true;
+                    // class_registered stays true; teardown will unregister it.
+                }
+                else
+                {
+                    // Log the class name, the window handle, the client
+                    // rect, and the owning thread id (acceptance).
+                    RECT cr{};
+                    GetClientRect(hwnd, &cr);
+                    snprintf(line, sizeof line,
+                             "[MGPU][T4] window created: class=\"%s\" hwnd=0x%p client=%dx%d "
+                             "(%d,%d,%d,%d) thread id 0x%X (client area is the T4-fixed 1280x720)",
+                             class_name, (void *)hwnd,
+                             cr.right - cr.left, cr.bottom - cr.top,
+                             cr.left, cr.top, cr.right, cr.bottom,
+                             (unsigned)tid);
+                    mgpu::diag::info(line);
+                    pump = true;
+
+                    // T5 (section 09): show the window without stealing
+                    // activation.
+                    //
+                    // ShowWindow's return value is NOT success or failure.
+                    // It is nonzero if the window was PREVIOUSLY VISIBLE and
+                    // zero if it was previously hidden. This window is
+                    // created without WS_VISIBLE, so it always returns FALSE
+                    // here, with GetLastError() == 0 - and an earlier version
+                    // of this code logged that as an error on every single
+                    // launch. There is nothing to check.
+                    // ---- V49: A GHOST IS NEVER SHOWN ----
+                    //
+                    // The first cut of V49 replaced the bridge's SWAPCHAIN and
+                    // left this line alone - so there was still an HWND in the
+                    // Z-order for an engine to see, and still a window you
+                    // could swap to and find a cursor on. A windowless
+                    // swapchain behind a window that is still there is not
+                    // windowless.
+                    //
+                    // The window is not destroyed, only never shown: the
+                    // message pump, the resize path and the title updates all
+                    // still hang off it, and a hidden window costs nothing and
+                    // participates in nothing. In mode 0 this line runs exactly
+                    // as it always has.
+                    if (!mgpu::gpu1::dcomp_overlay_mode())
+                    {
+                        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    }
+                    else
+                    {
+                        mgpu::diag::info("[MGPU][V49] the bridge window is created but NEVER "
+                                         "SHOWN - it exists only to own the message pump and the "
+                                         "resize path. Nothing of the bridge is in the Z-order. "
+                                         "If you can swap to a bridge window, this line did not "
+                                         "run.");
+                    }
+
+                    // P7.10: say what it is doing straight away. The present
+                    // loop refreshes this every half second, but if the present
+                    // chain fails to create, this is the only title the window
+                    // will ever have - and "starting" forever is a lie.
+                    set_window_title(hwnd, 0);
+
+                    // P1.3g. A GLOBAL hotkey, deliberately - not a key handled by
+                    // the bridge window. A window-scoped key would force the
+                    // bridge window to be focused before it could be pressed,
+                    // which is one of the three focus conditions we want to be
+                    // able to VARY. RegisterHotKey delivers WM_HOTKEY to this
+                    // thread's queue whatever holds the foreground, so the game
+                    // can stay focused, or the desktop, and the probe still fires.
+                    //
+                    // Must be registered on the thread that pumps, which is this
+                    // one. Ctrl+Alt+F10 rather than a bare function key: ReShade
+                    // owns Home, and games claim unmodified F-keys freely.
+                    // Failure is logged and non-fatal - the startup run still
+                    // happens, we just lose manual triggering.
+                    if (hwnd != nullptr)
+                    {
+                        if (RegisterHotKey(nullptr, MGPU_HOTKEY_ID,
+                                           MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F10) != FALSE)
+                        {
+                            hotkey_ok = true;
+                            // P6.3: the intensity keys. Each is independent -
+                            // one failing does not cost the others, and the log
+                            // names exactly which are available, because a key
+                            // that silently did not register is a knob the
+                            // operator will press and believe.
+                            const bool k_t = RegisterHotKey(nullptr, MGPU_HOTKEY_INT_TARGET,
+                                                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F8) != FALSE;
+                            const bool k_d = RegisterHotKey(nullptr, MGPU_HOTKEY_INT_DOWN,
+                                                MOD_CONTROL | MOD_ALT, VK_F9) != FALSE;
+                            const bool k_u = RegisterHotKey(nullptr, MGPU_HOTKEY_INT_UP,
+                                                MOD_CONTROL | MOD_ALT, VK_F11) != FALSE;
+                            const bool k_p =
+                                mgpu::gpu1::dcomp_overlay_mode() &&
+                                RegisterHotKey(nullptr, MGPU_HOTKEY_PEEK,
+                                    MOD_ALT | MOD_NOREPEAT, VK_F6) != FALSE;
+                            if (mgpu::gpu1::dcomp_overlay_mode())
+                            {
+                                char pk[440];
+                                snprintf(pk, sizeof pk,
+                                         "[MGPU][V52] peek hotkey: ALT+F6 hides and restores "
+                                         "the bridge visual = %s. DcompOverlay=1 puts the bridge "
+                                         "ABOVE the game's own ReShade overlay, so this is how "
+                                         "you reach that overlay - and how you dismiss the "
+                                         "run-end screen. It unroots a visual and roots it again; "
+                                         "the stream is never touched.",
+                                         k_p ? "OK" : "FAILED");
+                                if (k_p) mgpu::diag::info(pk);
+                                else     mgpu::diag::warn(pk);
+                            }
+                            const bool k_v = RegisterHotKey(nullptr, MGPU_HOTKEY_VIEW,
+                                                MOD_ALT | MOD_NOREPEAT, VK_F7) != FALSE;
+                            const bool s_l  = RegisterHotKey(nullptr, MGPU_HOTKEY_SEAM_L,
+                                                MOD_CONTROL | MOD_ALT, VK_LEFT) != FALSE;
+                            const bool s_r  = RegisterHotKey(nullptr, MGPU_HOTKEY_SEAM_R,
+                                                MOD_CONTROL | MOD_ALT, VK_RIGHT) != FALSE;
+                            const bool s_lc = RegisterHotKey(nullptr, MGPU_HOTKEY_SEAM_LC,
+                                                MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK_LEFT) != FALSE;
+                            const bool s_rc = RegisterHotKey(nullptr, MGPU_HOTKEY_SEAM_RC,
+                                                MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK_RIGHT) != FALSE;
+                            char sk[400];
+                            snprintf(sk, sizeof sk,
+                                     "[MGPU][P7.5] seam hotkeys: CTRL+ALT+LEFT/RIGHT move the split "
+                                     "seam = %s/%s | add SHIFT for a coarse step = %s/%s. They "
+                                     "repeat when held and need NO overlay open, so the seam can be "
+                                     "dragged across a face while the game is the only thing on "
+                                     "screen - which is the point of having them at all.",
+                                     s_l ? "OK" : "FAILED", s_r ? "OK" : "FAILED",
+                                     s_lc ? "OK" : "FAILED", s_rc ? "OK" : "FAILED");
+                            mgpu::diag::info(sk);
+                            char vk[300];
+                            snprintf(vk, sizeof vk,
+                                     "[MGPU][P7.4] view hotkey: ALT+F7 cycles output -> input "
+                                     "-> split = %s. Split shows the frame handed TO the model on "
+                                     "the left and what it produced on the right, THE SAME FRAME, "
+                                     "so the two halves cannot disagree about time, camera or "
+                                     "lighting. The neural stage is unchanged in all three.",
+                                     k_v ? "OK" : "FAILED");
+                            mgpu::diag::info(vk);
+                            char ik[420];
+                            snprintf(ik, sizeof ik,
+                                     "[MGPU][P6.3] intensity hotkeys: CTRL+ALT+F8 cycle target "
+                                     "(all/p1/p2/...) = %s | CTRL+ALT+F9 down = %s | CTRL+ALT+F11 "
+                                     "up = %s. Steps of 0.05, clamped 0.00-2.00, live from the "
+                                     "next frame - NGX parameters are set per evaluate, so no "
+                                     "re-arm and no relaunch. DOWN and UP repeat when held; the "
+                                     "target key does not.",
+                                     k_t ? "OK" : "FAILED", k_d ? "OK" : "FAILED",
+                                     k_u ? "OK" : "FAILED");
+                            if (k_t && k_d && k_u) mgpu::diag::info(ik);
+                            else                   mgpu::diag::warn(ik);
+                            mgpu::diag::info("[MGPU][P1.3g] hotkey registered: CTRL+ALT+F10 runs the "
+                                             "transit probe on demand, from any foreground window. "
+                                             "Press it once the game has settled - in gameplay, not "
+                                             "the menu - and again with a different window focused; "
+                                             "each run labels itself and records which window held "
+                                             "the foreground.");
+                        }
+                        else
+                        {
+                            char hk[256];
+                            snprintf(hk, sizeof hk,
+                                     "[MGPU][P1.3g] RegisterHotKey failed (GetLastError=%lu) - "
+                                     "CTRL+ALT+F10 is probably owned by another process. Manual runs "
+                                     "unavailable this launch; the startup run is unaffected.",
+                                     (unsigned long)GetLastError());
+                            mgpu::diag::warn(hk);
+                        }
+                    }
+
+                    // T5: the present chain on the GPU 1 device, against
+                    // this hwnd (bridge thread only). Failure is not fatal
+                    // to the window: the pump must stay (a window whose
+                    // thread stops pumping stalls the shell - section 09),
+                    // and the loop falls back to the T4 250 ms structure
+                    // with nothing to present.
+                    if (mgpu::gpu1::create_present_chain(hwnd))
+                    {
+                        have_chain = true;
+
+                        // P1.0: the NGX probe. Once, here, on the bridge
+                        // thread - the chain exists and the present loop has
+                        // not started, so CreateFeature's ~1.16 s stalls
+                        // nothing. 1280x720 is the T4-fixed client size of
+                        // this window, which is also what the chain was
+                        // created against. The return value is deliberately
+                        // ignored: the probe logs its own verdict, and a
+                        // failure must not change how the bridge behaves.
+                        //
+                        // nr-bridge [NRB4]: both startup probes are opt-in
+                        // (StartupProbes=1). See startup_probes_enabled().
+                        if (mgpu::gpu1::startup_probes_enabled())
+                        {
+                            (void)mgpu::gpu1::ngx_probe(1280, 720);
+
+                            // P1.3: the first milestone that touches the bus.
+                            // Runs whatever the NGX probe reported - the two
+                            // are independent questions, and a run that
+                            // answers only one of them is still worth having.
+                            (void)mgpu::gpu1::transit_probe();
+                        }
+                        else
+                        {
+                            mgpu::diag::info("[MGPU][NRB4] startup NGX + transit probes skipped "
+                                             "(StartupProbes=0). They open a second device on the "
+                                             "game's GPU while the game is still initialising.");
+                        }
+                    }
+                    else
+                        mgpu::diag::error("[MGPU][T5] no present chain on this cycle - the window "
+                                          "stays up without presenting (see the [MGPU][T5] creation "
+                                          "lines for the failing call)");
+                }
+            }
+        }
+        else
+        {
+            // No device on this cycle (a terminal refusal). No window, no
+            // class. The wait loop runs without the pump branch but keeps
+            // the 250 ms timeout so the device-removal poll still runs (a
+            // no-op with no device, but the structure is uniform).
+            snprintf(line, sizeof line,
+                     "[MGPU][T4] no device on this cycle - no window created; waiting without the "
+                     "pump branch (thread id 0x%X)",
+                     (unsigned)tid);
+            mgpu::diag::info(line);
+        }
+
+        // Requirement 3: the pumping loop, replacing the post-device
+        // WaitForSingleObject(INFINITE). One loop, one thread - no second
+        // thread for the pump. The stop event is the single shutdown
+        // signal; WM_QUIT is never the exit signal.
+        //
+        // T5 reshapes the pump path: with a present chain the loop is
+        // vsync-paced - Present(1, 0) blocks on vblank (~16 ms), so the
+        // 250 ms timed wait goes away for the present path. The stop event
+        // is checked non-blocking at the top of every frame, messages are
+        // drained every frame, and the device-removal poll moves from the
+        // 250 ms timer to a frame counter (every 60 frames, ~1 s: same
+        // intent, one loop). The no-chain path (no window, or a window
+        // whose present chain failed to create) keeps the T4 structure
+        // exactly as it was.
+        bool removed_logged = false;
+        unsigned long long frame = 0;   // T5: completed presents
+
+        // P7.10: AutoArm. Off unless mgpu.ini says otherwise, so every
+        // published measurement's conditions are the shipped default and a
+        // measurement run still arms by hand, in gameplay, where the operator
+        // chose it.
+        //
+        // Two conditions, not one. The frame count gives the game time to get
+        // past shader compilation and its own startup swapchain churn; the
+        // swapchain-quiet check is the one that matters, because the stream is
+        // armed ONCE against the game's swapchain as it stands at that instant.
+        // A rig log shows what happens when that is violated: a ResizeBuffers on
+        // the game's chain, and a second later a continuous run of DROPPED and
+        // REORDERED seals for the rest of the session.
+        const unsigned autoarm_at = mgpu::gpu1::autoarm_frames();
+        const unsigned long long AUTOARM_QUIET_MS = 3000;
+        bool autoarm_done = (autoarm_at == 0);
+        bool autoarm_waiting_logged = false;
+        if (autoarm_at != 0)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P7.10] AutoArm is ON: the stream will arm itself after %u presented "
+                     "frames AND %llu ms with no swapchain event. For a MEASUREMENT leave it off "
+                     "and arm by hand in gameplay - that is what every published figure ran under.",
+                     autoarm_at, (unsigned long long)AUTOARM_QUIET_MS);
+            mgpu::diag::info(line);
+        }
+
+        for (;;)
+        {
+            if (have_chain)
+            {
+                // T5: the present loop. Vsync (Present(1, 0)) is the
+                // pacing mechanism - there is no timed wait.
+                const DWORD sw = WaitForSingleObject(st().stop_event, 0);
+                if (sw == WAIT_OBJECT_0)
+                    break;   // shutdown
+                if (sw == WAIT_FAILED)
+                {
+                    // A failed wait is not transient (an invalid handle,
+                    // etc.); spinning would teach nothing. Log and tear
+                    // down cleanly (the T4 rule, kept).
+                    snprintf(line, sizeof line,
+                             "[MGPU][T5] wait failed (GetLastError=%lu) thread id 0x%X - tearing down",
+                             (unsigned long)GetLastError(), (unsigned)tid);
+                    mgpu::diag::error(line);
+                    break;
+                }
+
+                // Drain messages until the queue is empty, then present.
+                // WM_QUIT is never the exit signal (the stop event is) -
+                // discard it without dispatching, so a stray WM_QUIT cannot
+                // be mistaken for a shutdown.
+                MSG m;
+                bool run_transit = false;
+                // P6.3. Accumulated, not acted on inside the drain: a held key
+                // can deliver several messages per drain and each one should
+                // count, but the pump must finish first for the same reason the
+                // transit probe waits - pumping is what keeps this thread from
+                // stalling anything that broadcasts to top-level windows.
+                int int_delta = 0;
+                unsigned int_cycles = 0;
+                unsigned view_cycles = 0;
+                int seam_delta = 0;
+                int seam_coarse = 0;
+                while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE) != FALSE)
+                {
+                    if (m.message == WM_QUIT)
+                        continue;
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_INT_TARGET)
+                    { ++int_cycles; continue; }
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_INT_DOWN)
+                    { --int_delta; continue; }
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_INT_UP)
+                    { ++int_delta; continue; }
+                    // V52. Acted on HERE rather than counted like the others:
+                    // it changes no stream state, so there is nothing for the
+                    // present loop to pick up, and it runs on the thread that
+                    // owns the composition objects. Unreachable in mode 0 -
+                    // the key is not registered there.
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_PEEK)
+                    { (void)mgpu::gpu1::dcomp_peek_toggle(); continue; }
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_VIEW)
+                    { ++view_cycles; continue; }
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_SEAM_L)
+                    { --seam_delta; continue; }
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_SEAM_R)
+                    { ++seam_delta; continue; }
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_SEAM_LC)
+                    { --seam_coarse; continue; }
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_SEAM_RC)
+                    { ++seam_coarse; continue; }
+                    // P1.3g. WM_HOTKEY is thread-posted, not window-posted, so
+                    // it arrives here with hwnd == nullptr and never reaches a
+                    // window procedure. Flag it and run the probe AFTER the
+                    // queue is drained rather than inside the drain: the probe
+                    // takes ~100 ms, and pumping is what keeps this thread from
+                    // stalling anything that broadcasts to top-level windows.
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_ID)
+                    {
+                        run_transit = true;
+                        continue;
+                    }
+                    TranslateMessage(&m);
+                    DispatchMessageW(&m);
+                }
+
+                // P6.3. Target first, then the steps, so pressing F8 and F9 in
+                // the same drain does what the operator meant: retarget, then
+                // step the thing they just selected.
+                for (unsigned c = 0; c < int_cycles; ++c)
+                    mgpu::gpu1::intensity_cycle_target();
+                for (int d = 0; d < int_delta; ++d)  mgpu::gpu1::intensity_step(+1);
+                for (int d = 0; d > int_delta; --d)  mgpu::gpu1::intensity_step(-1);
+
+                // P7.4. The view cycles output -> input -> split -> output.
+                // Read the current mode rather than tracking one here: the
+                // panel can change it too, and two owners of one value is how
+                // a control starts lying about what it is showing.
+                if (view_cycles != 0)
+                {
+                    mgpu::gpu1::ui_state vs;
+                    mgpu::gpu1::ui_read(vs);
+                    int mode = vs.present_mode;
+                    for (unsigned c = 0; c < view_cycles; ++c) mode = (mode + 1) % 3;
+                    mgpu::gpu1::ui_set_present_mode(mode);
+                }
+
+                // NRB20. ALT+F12: DLSS 5 on/off. Off is present mode 1, the
+                // frame handed to the model, full screen - the same image as
+                // the left half of the split, which the development rig showed
+                // working when the visual's unroot (V52, V65) did not. Polled
+                // rather than registered: RegisterHotKey loses to any program
+                // that claimed the combination first and reserves F12 for
+                // debuggers, while the async key state is there whatever holds
+                // the focus. Edge-triggered, so holding the keys toggles once.
+                {
+                    static bool f12_was_down = false;
+                    const bool f12_down = (GetAsyncKeyState(VK_F12) & 0x8000) != 0 &&
+                                          (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+                    if (f12_down && !f12_was_down)
+                    {
+                        mgpu::gpu1::ui_state vs;
+                        mgpu::gpu1::ui_read(vs);
+                        const int to = (vs.present_mode == 0) ? 1 : 0;
+                        mgpu::gpu1::ui_set_present_mode(to);
+                        mgpu::diag::info(to == 0 ? "[MGPU][NRB20] ALT+F12: DLSS 5 ON (neural output)"
+                                                 : "[MGPU][NRB20] ALT+F12: DLSS 5 OFF (the game's own frame)");
+                    }
+                    f12_was_down = f12_down;
+                }
+
+                // P7.5. Seam steps, applied after the view so that pressing F7
+                // and an arrow in the same drain switches into split FIRST and
+                // then moves the seam, which is what the operator meant.
+                for (int d = 0; d < seam_delta;  ++d) mgpu::gpu1::ui_split_move(+1, false);
+                for (int d = 0; d > seam_delta;  --d) mgpu::gpu1::ui_split_move(-1, false);
+                for (int d = 0; d < seam_coarse; ++d) mgpu::gpu1::ui_split_move(+1, true);
+                for (int d = 0; d > seam_coarse; --d) mgpu::gpu1::ui_split_move(-1, true);
+
+                if (run_transit)
+                {
+                    ++manual_runs;
+                    char tag[64];
+                    snprintf(tag, sizeof tag, "manual %u @frame %llu",
+                             manual_runs, (unsigned long long)frame);
+                    // P5.2 / DEFECT C. The probe chain and the stream are now
+                    // MUTUALLY EXCLUSIVE, and the log says which one this press
+                    // armed. They used to arm together, which put two
+                    // independent NGX consumers on the one shared capability
+                    // block and produced a neural image with the colours wrong
+                    // while every seal counter stayed clean. A silent overlap of
+                    // two paths is the section 00a failure shape; naming the
+                    // path on every press is what stops it recurring unseen.
+                    if (mgpu::gpu1::probes_enabled())
+                    {
+                        // Its own buffer: the enclosing `line` is 320 bytes and
+                        // this message is longer, and a truncated log line is a
+                        // wrong answer that looks like a right one.
+                        char pl[512];
+                        snprintf(pl, sizeof pl,
+                                 "[MGPU][P1.3g] hotkey - PROBE CHAIN (mgpu.ini Probes=1): transit "
+                                 "probe (%s), then P1.5 capture and the P3.x neural probe. The "
+                                 "P4.0 stream is NOT armed on this press - the probes take the "
+                                 "same NGX parameter block the stream would hold. The present "
+                                 "loop stalls for the duration; a gap in the frame counter here "
+                                 "is this, not a fault.", tag);
+                        mgpu::diag::info(pl);
+                        (void)mgpu::gpu1::transit_probe(tag);
+                        // P1.5 rides the same key. It is inert until requested and
+                        // one-shot after that, so repeated presses cost nothing.
+                        mgpu::gpu1::capture_request();
+                    }
+                    else
+                    {
+                        mgpu::diag::info("[MGPU][P4.0] hotkey - STREAM (mgpu.ini Probes absent or "
+                                         "0, the default). The one-shot probe chain is NOT run: "
+                                         "P1.3, P1.5 and P3.0-P3.2 are closed questions and they "
+                                         "share the neural stage's parameter block. Set Probes=1 "
+                                         "to run them instead - the stream is then not armed.");
+                        // P4.0: one stream per process, armed on demand so the
+                        // operator picks gameplay rather than a menu.
+                        mgpu::gpu1::stream_request();
+                    }
+                }
+
+                // The colour must animate: a static clear cannot
+                // distinguish "presenting" from "presented once and hung."
+                // Driven by the frame counter, not a clock: three
+                // phase-shifted sinusoids, 180 frames per revolution
+                // (~3 s at the vblank pace). The modulo keeps the argument
+                // to sin bounded.
+                constexpr unsigned long long REV_PERIOD = 180;
+                constexpr float TAU = 6.283185307179586f;
+                const float ph = TAU * static_cast<float>(frame % REV_PERIOD) /
+                                 static_cast<float>(REV_PERIOD);
+                const float cr = 0.5f + 0.5f * std::sin(ph);
+                const float cg = 0.5f + 0.5f * std::sin(ph + TAU / 3.0f);
+                const float cb = 0.5f + 0.5f * std::sin(ph + 2.0f * TAU / 3.0f);
+
+                // ---- P7.10: AutoArm. MOVED HERE 2026-09-12. ----
+                //
+                // IT USED TO SIT AFTER present_frame, AND THAT IS WHY IT
+                // CRASHED. AutoArm=1 died at arm on V21, V22 and V23 while
+                // arming BY HAND worked on the same builds, in the same
+                // session, with the same ini; Reflex=0 made no difference, so
+                // the two arms differ by WHERE they happen, not by what they
+                // do.
+                //
+                // The hotkey arms from the message pump above - before
+                // stream_poll, before the present gate, before present_frame.
+                // AutoArm armed after present_frame, in the tail of the
+                // iteration, while claiming in its own log line to be
+                // "identical to pressing CTRL+ALT+F10". It was not identical
+                // and the log said it was, which is the worst combination:
+                // stream_request() creates the NGX features by resetting
+                // s.na/s.nl - the SAME single allocator and list the per-frame
+                // consume path records into - so the safe moment to arm is the
+                // one the hotkey uses, at the top of an iteration, and not the
+                // one immediately behind a present.
+                //
+                // Also evaluated on EVERY iteration now rather than only on
+                // ones that got past the present gate. The gate returns false
+                // whenever nothing new has arrived, which is most iterations
+                // while the game is still loading - exactly the window AutoArm
+                // is counting through.
+                // V19. THE PANEL ARMS, AND HOLDS AUTOARM WHILE IT IS OPEN.
+                // Taken before the AutoArm block so a manual arm always wins.
+                if (mgpu::gpu1::ui_take_arm_request())
+                {
+                    autoarm_done = true;   // manual arm stands down the timer
+                    mgpu::diag::info("[MGPU][P7.10] ARM NOW pressed in the panel. Settings are "
+                                     "read from mgpu.ini at this moment, so anything changed in "
+                                     "the panel before now applies to THIS session.");
+                    mgpu::gpu1::stream_request();
+                }
+
+                // V55. Hold AutoArm while the one-display hint is on screen -
+                // ten seconds of wall clock, not a frame count, because 600
+                // frames is ten seconds at 60 Hz and under three at 240 Hz and
+                // the line has to be readable on both. Only ever true for a
+                // headless single-display rig that is NOT already using the
+                // mode, so nobody else's arm timing moves by a millisecond.
+                if (!autoarm_done && frame >= autoarm_at &&
+                    !mgpu::gpu1::ui_panel_is_open() &&
+                    !mgpu::gpu1::autoarm_hint_holding())
+                {
+                    const unsigned long long quiet =
+                        mgpu::adapter::ms_since_last_swapchain_event();
+                    if (quiet >= AUTOARM_QUIET_MS)
+                    {
+                        mgpu::gpu1::ui_state ast;
+                        mgpu::gpu1::ui_read(ast);
+                        if (ast.armed)
+                        {
+                            // Armed by hand while we were waiting. Stand down
+                            // silently rather than arming a second time.
+                            autoarm_done = true;
+                        }
+                        else
+                        {
+                            autoarm_done = true;
+                            snprintf(line, sizeof line,
+                                     "[MGPU][P7.10] AutoArm firing at frame %llu (%llu ms since "
+                                     "the last swapchain event), from the same point in the loop "
+                                     "the hotkey arms from. If the game is still in a menu the "
+                                     "stream is armed against menu frames, which is correct but "
+                                     "measures nothing.",
+                                     (unsigned long long)frame, quiet);
+                            mgpu::diag::info(line);
+                            mgpu::gpu1::stream_request();
+                        }
+                    }
+                    else if (!autoarm_waiting_logged)
+                    {
+                        autoarm_waiting_logged = true;
+                        snprintf(line, sizeof line,
+                                 "[MGPU][P7.10] AutoArm reached its frame count at %llu but the "
+                                 "game's swapchain changed %llu ms ago - waiting for %llu ms of "
+                                 "quiet. Arming across a swapchain rebuild is what produces a "
+                                 "session-long run of DROPPED and REORDERED seals.",
+                                 (unsigned long long)frame, quiet,
+                                 (unsigned long long)AUTOARM_QUIET_MS);
+                        mgpu::diag::info(line);
+                    }
+                }
+
+                // P5.1. Poll first, then decide whether there is anything worth
+                // presenting. When the stream is running this paces the loop to
+                // NEW neural frames instead of to vsync; when it is idle the
+                // gate returns true every time and the loop behaves exactly as
+                // T5 shipped it. The gate does the waiting itself, so a false
+                // return means "nothing new, and we have already slept".
+                mgpu::gpu1::stream_poll();
+                if (!mgpu::gpu1::stream_present_gate(4))
+                    continue;
+
+                if (!mgpu::gpu1::present_frame(cr, cg, cb))
+                {
+                    // The first failure is already logged with its step,
+                    // HRESULT and removal reason (one-shot, in
+                    // gpu1_context). Stop presenting: the loop exits to
+                    // the ordered teardown.
+                    break;
+                }
+                // P1.5: cheap, self-disarming, and does nothing at all until a
+                // frame has actually been captured. Placed after the present so
+                // its one expensive poll cannot delay a frame that was ready.
+                mgpu::gpu1::capture_poll();
+
+                ++frame;
+                if (frame == 1)
+                {
+                    mgpu::diag::info("[MGPU][T5] first successful present (frame 1) - the "
+                                     "vsync-paced present loop is alive");
+                }
+                else if (frame % 600 == 0)
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][T5] present loop alive: frame %llu thread id 0x%X",
+                             (unsigned long long)frame, (unsigned)tid);
+                    mgpu::diag::info(line);
+                }
+
+                // P7.10: the title as a status line. Every 30 frames (~0.5 s)
+                // and once at frame 1, so the window says what it is doing
+                // before anyone opens an overlay. SetWindowTextW on the thread
+                // that owns the window, which is this one.
+                if (frame == 1 || frame % 30 == 0)
+                    set_window_title(hwnd, frame);
+
+                // The device-removal poll, moved from the 250 ms timer to
+                // a frame counter (every 60 frames, ~1 s at vblank): same
+                // intent, one loop. T4's line verbatim - it identifies the
+                // T4 acceptance item, which this branch now hosts.
+                if (frame % 60 == 0)
+                {
+                    HRESULT reason = S_OK;
+                    if (mgpu::gpu1::device_removed_reason(reason) && reason != S_OK && !removed_logged)
+                    {
+                        snprintf(line, sizeof line,
+                                 "[MGPU][T4] device removed: GetDeviceRemovedReason hr=0x%08X (sticky - "
+                                 "logged once on the transition away from S_OK), thread id 0x%X",
+                                 (unsigned)reason, (unsigned)tid);
+                        mgpu::diag::error(line);
+                        removed_logged = true;
+                    }
+                }
+                continue;
+            }
+
+            // No present chain: the T4 structure, unchanged.
+            DWORD wr;
+            if (pump)
+                wr = MsgWaitForMultipleObjects(1, &st().stop_event, FALSE, 250, QS_ALLINPUT);
+            else
+                wr = WaitForSingleObject(st().stop_event, 250);
+
+            if (wr == WAIT_FAILED)
+            {
+                // A failed wait is not transient (an invalid handle, etc.);
+                // spinning would teach nothing. Log and tear down cleanly.
+                snprintf(line, sizeof line,
+                         "[MGPU][T4] wait failed (GetLastError=%lu) thread id 0x%X - tearing down",
+                         (unsigned long)GetLastError(), (unsigned)tid);
+                mgpu::diag::error(line);
+                break;
+            }
+
+            if (wr == WAIT_OBJECT_0)
+                break;   // shutdown
+
+            if (pump && wr == WAIT_OBJECT_0 + 1)
+            {
+                // Messages are waiting: drain them until the queue is empty,
+                // then loop. WM_QUIT is never the exit signal (the stop
+                // event is) - discard it without dispatching, so a stray
+                // WM_QUIT cannot be mistaken for a shutdown.
+                MSG m;
+                while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE) != FALSE)
+                {
+                    if (m.message == WM_QUIT)
+                        continue;
+                    TranslateMessage(&m);
+                    DispatchMessageW(&m);
+                }
+                continue;
+            }
+
+            // WAIT_TIMEOUT: the poll tick (250 ms). Call the removal-reason
+            // accessor and log only on the transition away from S_OK - the
+            // value is sticky once removed (brief section 09), so a healthy
+            // device is silent by construction.
+            HRESULT reason = S_OK;
+            if (mgpu::gpu1::device_removed_reason(reason) && reason != S_OK && !removed_logged)
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][T4] device removed: GetDeviceRemovedReason hr=0x%08X (sticky - "
+                         "logged once on the transition away from S_OK), thread id 0x%X",
+                         (unsigned)reason, (unsigned)tid);
+                mgpu::diag::error(line);
+                removed_logged = true;
+            }
+        }
+
+        // Requirement 5: ordered teardown, on this same thread and in this
+        // order, before rearm(). Everything the thread owns is released
+        // before it re-arms, so a replacement thread's RegisterClassExW
+        // cannot race this thread's cleanup.
+        //
+        // T5 reorders it: the present chain (and the device) go FIRST.
+        // The T4 order (DestroyWindow first) is wrong once a swapchain
+        // exists - the swapchain holds a reference to the window it was
+        // created against and would outlive it. gpu1::shutdown() drains
+        // the GPU before releasing the chain, and is a no-op for the chain
+        // when none was created (the no-window path is unaffected).
+        if (hotkey_ok)
+        {
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_ID);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_TARGET);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_DOWN);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_UP);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_VIEW);
+            // V52: only ever registered in ghost mode.
+            if (mgpu::gpu1::dcomp_overlay_mode())
+                UnregisterHotKey(nullptr, MGPU_HOTKEY_PEEK);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_L);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_R);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_LC);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_RC);
+            mgpu::diag::info("[MGPU][P1.3g] hotkeys unregistered (transit + P6.3 intensity)");
+        }
+
+        mgpu::diag::info("[MGPU][T5] shutdown - ordered teardown (NGX features -> "
+                         "gpu1::shutdown [present chain -> device] -> DestroyWindow -> "
+                         "UnregisterClass -> adapter::shutdown)");
+
+        // V32. THE NGX FEATURES GO FIRST, BEFORE THE DEVICE THEY WERE CREATED
+        // AGAINST. Nothing did this before: stream_release() only ran on a
+        // failed arm or a stream that reached its frame bound, so an ordinary
+        // game exit abandoned the NR handles, the SR handle, both parameter
+        // blocks and the driver snippet DLL - and then the line below released
+        // the device underneath them. That is the second-launch crash.
+        mgpu::gpu1::stream_shutdown();
+
+        mgpu::gpu1::shutdown();
+
+        if (hwnd != nullptr)
+        {
+            // DestroyWindow must be called from the thread that created the
+            // window (this thread); from any other thread it returns FALSE
+            // with ERROR_ACCESS_DENIED.
+            if (DestroyWindow(hwnd) == FALSE)
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][T4] DestroyWindow failed (GetLastError=%lu) hwnd=0x%p thread id 0x%X",
+                         (unsigned long)GetLastError(), (void *)hwnd, (unsigned)tid);
+                mgpu::diag::error(line);
+            }
+            else
+            {
+                mgpu::diag::info("[MGPU][T4] window destroyed");
+            }
+            hwnd = nullptr;
+        }
+
+        if (class_registered)
+        {
+            // Unregister the class we registered (or that a prior cycle of
+            // this same still-mapped module left behind). The class name is
+            // per-module, so this targets exactly our class.
+            if (UnregisterClassW(class_name_w, mgpu::module_handle()) == FALSE)
+            {
+                // Not fatal: the OS unregisters a class automatically when
+                // the owning module unmaps, so it may already be gone. Log
+                // for the record.
+                snprintf(line, sizeof line,
+                         "[MGPU][T4] UnregisterClassW returned FALSE (GetLastError=%lu) class=\"%s\" "
+                         "(not fatal - the class may already be gone)",
+                         (unsigned long)GetLastError(), class_name);
+                mgpu::diag::info(line);
+            }
+            else
+            {
+                mgpu::diag::info("[MGPU][T4] window class unregistered");
+            }
+            class_registered = false;
+        }
+
+        mgpu::adapter::shutdown();
+        mgpu::diag::info("[MGPU][T4] bridge thread exiting cleanly");
+
+        if (failed_permanently)
+        {
+            // Do not re-arm: a failed cycle must not spawn a replacement
+            // thread and retry (the "P0 cannot proceed past T4" line was
+            // already logged at the failure site). Close the thread handle
+            // to avoid the per-cycle leak, but leave started = true so
+            // ensure_started() never spawns a replacement.
+            std::lock_guard<std::mutex> lk(st().cs);
+            if (st().thread != nullptr)
+            {
+                CloseHandle(st().thread);
+                st().thread = nullptr;
+            }
+            st().thread_id = 0;
+            return 0;
+        }
+
+        rearm();
+        return 0;
+    }
+}
+
+void ensure_started()
+{
+    bool expected = false;
+    if (!st().started.compare_exchange_strong(expected, true))
+        return;
+
+    // Publish the ready event before the thread exists: the _beginthreadex
+    // call is the happens-before edge, so the worker's first read of the
+    // handle is race-free.
+    mgpu::adapter::ready_event();
+
+    std::lock_guard<std::mutex> lk(st().cs);
+    // A re-arm after a prior thread exited reuses the stop event (that
+    // thread's rearm() left it reset, see above); only the very first
+    // start - or a retry after a failed start, which closed it - creates
+    // one.
+    if (st().stop_event == nullptr)
+        st().stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    unsigned tid = 0;
+    const uintptr_t th = _beginthreadex(nullptr, 0, bridge_main, nullptr, 0, &tid);
+    if (th == 0)
+    {
+        char line[160];
+        snprintf(line, sizeof line,
+                 "[MGPU][T3] _beginthreadex failed (GetLastError=%lu) - bridge thread not started",
+                 (unsigned long)GetLastError());
+        mgpu::diag::error(line);
+        if (st().stop_event != nullptr)
+        {
+            CloseHandle(st().stop_event);
+            st().stop_event = nullptr;
+        }
+        st().started = false;   // allow a later device/swapchain event to retry
+        return;
+    }
+    st().thread = reinterpret_cast<HANDLE>(th);
+    st().thread_id = static_cast<DWORD>(tid);
+    char line[160];
+    snprintf(line, sizeof line, "[MGPU][T3] bridge thread spawned (thread id 0x%X)",
+             (unsigned)st().thread_id);
+    mgpu::diag::info(line);
+}
+
+void stop()
+{
+    // Signal-only. Never wait:
+    //  - From DllMain we are under the loader lock, and a thread cannot
+    //    finish exiting without that lock (its exit dispatches
+    //    DLL_THREAD_DETACH to every loaded module): a join would deadlock,
+    //    and a timed-out join would leave a live thread pointing into a
+    //    DLL that is about to unmap.
+    //  - From a ReShade callback the game thread must never block.
+    // The mutex is never held across a wait (only to copy the handle).
+    //
+    // The bridge thread performs the actual teardown (T4: DestroyWindow,
+    // UnregisterClass, device release, adapter release, final log lines,
+    // re-arm) once it wakes. That is best effort: if the process exits
+    // before it wakes, the OS reclaims the GPU objects; if ReShade unloads
+    // this module dynamically first, the GPU 1 device is simply leaked.
+    // Explicitly in scope at P0 - a hang is not.
+    HANDLE ev = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(st().cs);
+        ev = st().stop_event;
+    }
+    if (ev != nullptr)
+        SetEvent(ev);
+}
+}

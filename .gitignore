@@ -1,0 +1,18 @@
+# build output
+build/
+out/
+
+# third-party clones kept for reading, not vendored
+reference/
+
+# downloaded headers (tools\fetch-deps.ps1)
+third_party/
+bridge/ext/
+
+# run logs and probe output (tools write them here)
+results/
+
+# third-party binaries you supply (vendor/README.md lists them) - never committed
+vendor/*
+!vendor/README.md
+
